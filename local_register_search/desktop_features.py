@@ -54,10 +54,10 @@ def write_records(destination, records):
             names.setdefault(column, [])
             if name and name not in names[column]:
                 names[column].append(name)
-    headers = ['File', 'Sheet', 'Excel row'] + [(' / '.join(names[column]) + f' ({column})') if names.get(column) else column for column in columns]
+    headers = ['File', 'Sheet', 'Excel row'] + [(' / '.join(names[column]) + f' ({column})') if names.get(column) else column for column in columns] + ['Section']
     def values(row):
         cells = json.loads(row['cells'])
-        return [row['path'], row['sheet'], row['rownum']] + [cells.get(column, '') for column in columns]
+        return [row['path'], row['sheet'], row['rownum']] + [cells.get(column, '') for column in columns] + [row.get('row_section') or '']
     if Path(destination).suffix.lower() == '.xlsx':
         book = Workbook()
         sheet = book.active

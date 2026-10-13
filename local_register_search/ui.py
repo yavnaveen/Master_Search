@@ -12,9 +12,10 @@ from PySide6.QtGui import QDesktopServices, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem, QTextBrowser,
     QLabel, QListWidget, QFileDialog, QMessageBox, QSplitter, QProgressBar)
-from .database import connect, data_dir
-from .indexer import sync, local_folder, upgrade_saved_headers
+from .database import connect, data_dir, needs_search_update
+from .indexer import sync, local_folder
 from .search import search
+from .search_terms import valid_query, match_spans
 
 
 class Worker(QThread):
@@ -38,12 +39,14 @@ class Window(QMainWindow):
         self.setWindowTitle('Local Register Search')
         self.resize(1250, 850)
         self.path = data_dir() / 'index.sqlite3'
-        upgrade_saved_headers(self.path)
         db = connect(self.path)
         saved = db.execute("SELECT value FROM settings WHERE key='folders'").fetchone()
         preferences = db.execute("SELECT value FROM settings WHERE key='desktop_preferences'").fetchone()
         db.close()
         self.preferences = json.loads(preferences[0]) if preferences else {}
+        self.column_widths = self.preferences.get('column_widths', {})
+        self.include_section = self.preferences.get('include_section', True)
+        self.rendering_results = False
         self.recent_searches = self.preferences.get('recent_searches', [])
         self.dark_mode = self.preferences.get('dark_mode', False)
         self.auto_sync = self.preferences.get('auto_sync', False)
@@ -71,7 +74,8 @@ class Window(QMainWindow):
         self.timer.setSingleShot(True)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.run_search)
-        self.query.textChanged.connect(self.schedule_search)
+        self.query.textChanged.connect(self.input_changed)
+        self.file_filter.currentIndexChanged.connect(self.refresh_worksheets)
         for combo in (self.mode, self.file_filter, self.sheet_filter, self.page_size):
             combo.currentIndexChanged.connect(self.schedule_search)
         self.table.itemSelectionChanged.connect(self.show_detail)
@@ -121,10 +125,18 @@ class Window(QMainWindow):
         self.page = 0
         self.run_search()
 
+    def input_changed(self, *args):
+        self.timer.stop()
+        self.generation += 1
+        self.search_pending = False
+        self.export_button.setEnabled(False)
+        if not valid_query(self.query.text()):
+            self.search_done(self.generation, (0, []))
+
     def use_recent_search(self, index):
         value = self.recent.itemData(index)
         if value:
-            self.query.setText(value)
+            self.query.load_query(value)
             self.submit_search()
 
     def set_dark_mode(self, enabled):
@@ -132,10 +144,17 @@ class Window(QMainWindow):
         self.apply_theme()
         self.save_preferences()
 
+    def set_include_section(self, enabled):
+        self.include_section = enabled
+        self.preferences['include_section'] = enabled
+        self.save_preferences()
+        self.schedule_search()
+
     def apply_theme(self):
         from .layout import DARK_STYLE
         self.setStyleSheet(self.light_style + (DARK_STYLE if self.dark_mode else ''))
         self.table.dark_mode = self.dark_mode
+        self.query.set_theme(self.dark_mode)
         # Inline label colors would otherwise override the dark stylesheet.
         for label in self.findChildren(QLabel):
             original = label.property('lightStyle')
@@ -182,7 +201,7 @@ class Window(QMainWindow):
             self.start_sync(False)
 
     def sort_results(self, column):
-        keys = ['file', 'sheet', 'row'] + self.result_columns
+        keys = ['file', 'sheet', 'row'] + self.result_columns + ['section']
         if column >= len(keys):
             return
         key = keys[column]
@@ -215,7 +234,7 @@ class Window(QMainWindow):
         if Path(destination).suffix.lower() not in {'.xlsx', '.csv'}:
             destination += '.csv' if 'CSV' in selected_filter else '.xlsx'
         from .desktop_features import export_records
-        args = (self.path, self.query.text(), self.mode.currentText(), self.file_filter.currentData() or '', self.sheet_filter.currentData() or '', 0, -1, self.sort)
+        args = (self.path, getattr(self, 'active_query', self.query.text()), self.mode.currentText(), self.file_filter.currentData() or '', self.sheet_filter.currentData() or '', 0, -1, self.sort, self.include_section)
         self.export_button.setEnabled(False)
         self.export_busy = True
         self.notify('Exporting all matching results…')
@@ -272,6 +291,36 @@ class Window(QMainWindow):
         for i, folder in enumerate(self.folders):
             self.folder_list.item(i).setText(Path(folder).name or folder)
             self.folder_list.item(i).setToolTip(folder)
+        if hasattr(self, 'folder_filter'):
+            selected = self.folder_filter.currentData()
+            self.folder_filter.blockSignals(True)
+            self.folder_filter.clear()
+            self.folder_filter.addItem('Select folder', '')
+            for folder in self.folders:
+                self.folder_filter.addItem(Path(folder).name or folder, folder)
+                self.folder_filter.setItemData(self.folder_filter.count() - 1, folder, Qt.ItemDataRole.ToolTipRole)
+            self.folder_filter.setCurrentIndex(max(0, self.folder_filter.findData(selected)))
+            self.folder_filter.blockSignals(False)
+            self.select_folder_from_dropdown()
+
+    def show_tab(self, index):
+        self.pages.setCurrentIndex(index)
+        for number, button in enumerate(self.nav_buttons):
+            button.setChecked(number == index)
+        if index == 0:
+            self.query.setFocus()
+
+    def select_folder_from_dropdown(self, *args):
+        folder = self.folder_filter.currentData()
+        self.folder_list.blockSignals(True)
+        self.folder_list.setCurrentRow(self.folders.index(folder) if folder in self.folders else -1)
+        self.folder_list.blockSignals(False)
+
+    def select_folder_from_list(self, row):
+        folder = self.folders[row] if 0 <= row < len(self.folders) else ''
+        self.folder_filter.blockSignals(True)
+        self.folder_filter.setCurrentIndex(max(0, self.folder_filter.findData(folder)))
+        self.folder_filter.blockSignals(False)
 
     def add_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Select local register folder')
@@ -302,6 +351,11 @@ class Window(QMainWindow):
         self.table.setVisible(not empty)
         self.empty_title.setText('Get started' if first_run else 'No matching records')
         self.empty_message.setText('Step 1: Add folder\nStep 2: Sync files\nStep 3: Search\n\nDrop a local folder here to add it.' if first_run else 'Try another keyword, or choose All files and All worksheets.')
+        if not valid_query(self.query.text()):
+            self.empty_title.setText('Search your registers')
+            self.empty_message.setText('Type a keyword and press Enter.')
+        if getattr(self, 'index_update_needed', False) and valid_query(self.query.text()):
+            self.empty_message.setText('Search index update ho raha hai. Sync files dobara dabayein')
         self.empty_sync.setVisible(first_run and bool(self.folders))
         self.empty_add.setVisible(first_run)
         self.empty_reset.setVisible(not first_run)
@@ -321,7 +375,7 @@ class Window(QMainWindow):
             self.status.setText('Folder removed from scanning. Existing records remain until you clear the index in Settings.')
             self.notify('Folder removed from the scan list.')
         else:
-            self.notify('Select a folder in the sidebar first.', True)
+            self.notify('Select a folder in the Folders tab first.', True)
 
     def delete_folder_data(self):
         if self.jobs or self.scanning:
@@ -329,7 +383,7 @@ class Window(QMainWindow):
             return
         index = self.folder_list.currentRow()
         if index < 0:
-            QMessageBox.information(self, 'Select folder', 'Select a register folder in the sidebar first.')
+            QMessageBox.information(self, 'Select folder', 'Select a register folder from the Folder dropdown or Folders tab first.')
             return
         folder = self.folders[index]
         if QMessageBox.question(self, 'Clear selected folder index',
@@ -407,12 +461,16 @@ class Window(QMainWindow):
             self.watch_snapshot = {row['path']: (row['mtime'], row['size']) for row in db.execute('SELECT path,mtime,size FROM files')
                                    if any(Path(row['path']).is_relative_to(Path(folder)) for folder in self.folders)}
             db.close()
-        self.schedule_search()
+        self.query.clear()
+        self.timer.stop()
+        self.page = 0
+        self.generation += 1
+        self.search_pending = False
+        self.search_done(self.generation, (0, []))
 
     def refresh_filters(self):
         db = connect(self.path)
-        for combo, title, sql in [(self.file_filter, 'All files', 'SELECT path FROM files ORDER BY path'),
-                                  (self.sheet_filter, 'All worksheets', 'SELECT DISTINCT sheet FROM rows ORDER BY sheet')]:
+        for combo, title, sql in [(self.file_filter, 'All files', 'SELECT path FROM files ORDER BY path')]:
             selected = combo.currentData()
             combo.blockSignals(True)
             combo.clear()
@@ -423,6 +481,7 @@ class Window(QMainWindow):
             index = combo.findData(selected)
             combo.setCurrentIndex(max(0, index))
             combo.blockSignals(False)
+        self.refresh_worksheets()
         last = db.execute("SELECT value FROM settings WHERE key='last_sync'").fetchone()
         stale = db.execute('SELECT count(*) FROM files WHERE stale=1').fetchone()[0]
         if stale:
@@ -430,14 +489,42 @@ class Window(QMainWindow):
         self.setWindowTitle(f"Local Register Search • {stale} stale files" if stale else 'Local Register Search')
         indexed = db.execute('SELECT count(*) FROM files WHERE stale=0').fetchone()[0]
         self.indexed = db.execute('SELECT count(*) FROM rows').fetchone()[0]
+        self.index_update_needed = needs_search_update(db)
+        if self.index_update_needed:
+            self.status.setText('Search index update ho raha hai. Sync files dobara dabayein')
         self.index_summary.setText(f"{indexed:,} files indexed | Last sync: {self.format_sync(last[0]) if last else 'Never'}")
         self.index_summary.setToolTip(self.index_summary.text())
         db.close()
         self.update_empty_state()
 
+    def refresh_worksheets(self, *args):
+        from .filter_dropdown import natural_key
+        selected = self.sheet_filter.currentData()
+        file = self.file_filter.currentData() or ''
+        db = connect(self.path)
+        try:
+            records = db.execute('SELECT DISTINCT sheet FROM rows WHERE path=?', (file,)) if file else db.execute('SELECT DISTINCT sheet FROM rows')
+            sheets = sorted((row[0] for row in records), key=natural_key)
+        finally:
+            db.close()
+        self.sheet_filter.blockSignals(True)
+        self.sheet_filter.clear()
+        self.sheet_filter.addItem('All worksheets', '')
+        for sheet in sheets:
+            self.sheet_filter.addItem(sheet, sheet)
+            self.sheet_filter.setItemData(self.sheet_filter.count() - 1, sheet, Qt.ItemDataRole.ToolTipRole)
+        self.sheet_filter.setCurrentIndex(max(0, self.sheet_filter.findData(selected)))
+        self.sheet_filter.blockSignals(False)
+
     def schedule_search(self, *args):
         self.page = 0
         self.generation += 1
+        self.export_button.setEnabled(False)
+        if not valid_query(self.query.text()):
+            self.timer.stop()
+            self.search_pending = False
+            self.search_done(self.generation, (0, []))
+            return
         self.timer.start()
 
     def change_page(self, delta):
@@ -447,6 +534,11 @@ class Window(QMainWindow):
             self.run_search()
 
     def run_search(self):
+        self.export_button.setEnabled(False)
+        if not valid_query(self.query.text()):
+            self.generation += 1
+            self.search_done(self.generation, (0, []))
+            return
         if self.search_busy:
             self.search_pending = True
             return
@@ -454,8 +546,9 @@ class Window(QMainWindow):
         self.search_pending = False
         self.generation += 1
         generation = self.generation
+        self.requested_keywords = self.query.keyword_colors()
         args = (self.path, self.query.text(), self.mode.currentText(), self.file_filter.currentData() or '',
-                self.sheet_filter.currentData() or '', self.page, self.page_size.currentData(), self.sort)
+                self.sheet_filter.currentData() or '', self.page, self.page_size.currentData(), self.sort, self.include_section)
         self.count.setText('Searching…')
         self.launch(Worker(lambda worker: search(*args)), lambda result: self.complete_search(generation, result))
 
@@ -472,27 +565,35 @@ class Window(QMainWindow):
             self.count.setText('Search failed: ' + result['failure'])
             return
         self.total, self.rows = result
+        self.active_keywords = getattr(self, 'requested_keywords', self.query.keyword_colors())
+        from .chip_input import quoted
+        self.active_query = ' '.join(quoted(value) for value, color in self.active_keywords) if self.rows else ''
+        self.rendering_results = True
         self.table.reset_lift()
         cells = [json.loads(row['cells']) for row in self.rows]
-        last_column = max((column_index_from_string(key) for record in cells for key in record), default=0)
+        header_sets = [json.loads(row.get('headers') or '{}') for row in self.rows]
+        last_column = max((column_index_from_string(key) for record in cells + header_sets for key in record), default=0)
         columns = [get_column_letter(number) for number in range(1, last_column + 1)]
         self.result_columns = columns
         self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
         self.table.clearContents()
-        self.table.setColumnCount(3 + len(columns))
-        header_sets = [json.loads(row.get('headers') or '{}') for row in self.rows]
+        self.table.setColumnCount(4 + len(columns))
+        mixed_headers = any(row.get('mixed_headers') for row in self.rows) or len({json.dumps(headers, sort_keys=True) for headers in header_sets}) > 1
         labels = []
         for column in columns:
-            names = list(dict.fromkeys(headers[column] for headers in header_sets if headers.get(column)))
-            labels.append(' / '.join(names) if names else column)
-        self.table.setHorizontalHeaderLabels(['File', 'Sheet', 'Row'] + labels)
+            names = list(dict.fromkeys(headers[column].strip() for headers in header_sets if headers.get(column, '').strip()))
+            labels.append(names[0] if names and not mixed_headers else f'Column {column}')
+        self.table.setHorizontalHeaderLabels(['File', 'Sheet', 'Row'] + labels + ['Section'])
+        self.table.setColumnWidth(3 + len(columns), self.column_widths.get('section', 240))
+        for j, (key, width) in enumerate(zip(('file', 'sheet', 'row'), (220, 140, 65))):
+            self.table.setColumnWidth(j, self.column_widths.get(key, width))
         for j, column in enumerate(columns, 3):
             self.table.horizontalHeaderItem(j).setToolTip(f'Excel column {column}: {labels[j - 3]}')
         for j in range(3, 3 + len(columns)):
             name = labels[j - 3].casefold()
             width = 310 if 'subject' in name or 'description' in name else 180 if 'letter' in name else 110 if 'date' in name else 70 if name in ('s. n.', 's.n.', 's no', 's. no.') else 130
-            self.table.setColumnWidth(j, width)
+            self.table.setColumnWidth(j, self.column_widths.get('cell:' + columns[j - 3] + ':' + labels[j - 3], width))
             self.table.setItemDelegateForColumn(j, self.match_delegate)
         self.table.setRowCount(len(self.rows))
         self.detail.clear()
@@ -500,17 +601,28 @@ class Window(QMainWindow):
             values = [Path(row['path']).name + (' [STALE]' if row['stale'] else ''),
                       row['sheet'] + (' [hidden]' if row['hidden'] else ''), str(row['rownum'])]
             values.extend(self.display_cell(cells[i].get(column, '')) for column in columns)
+            values.append(row.get('row_section') or '')
             for j, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                item = QTableWidgetItem(value if value else '-')
+                if not value:
+                    item.setData(Qt.ItemDataRole.UserRole, 'empty-cell')
+                elif j < 3:
+                    item.setData(Qt.ItemDataRole.UserRole, 'metadata')
+                numeric = j == 2 or (j >= 3 and bool(re.fullmatch(r'[+-]?(?:\d[\d,]*(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?%?', value.strip())))
+                item.setTextAlignment((Qt.AlignmentFlag.AlignRight if numeric else Qt.AlignmentFlag.AlignLeft) | Qt.AlignmentFlag.AlignVCenter)
                 item.setToolTip(row['path'] + '\nSheet: ' + row['sheet'] if j == 0 else value)
                 self.table.setItem(i, j, item)
+        self.table.resizeRowsToContents()
+        self.rendering_results = False
         self.table.setUpdatesEnabled(True)
         self.table.blockSignals(False)
         self.table.update_frozen()
         size = self.page_size.currentData()
         start = self.page * size + 1 if size > 0 else 1
-        pages = (self.total + size - 1) // size if size > 0 else 1
-        self.count.setText(f'Showing {start}-{start + len(self.rows) - 1} of {self.total} rows | Page {self.page + 1}/{pages}' if self.total else ('No indexed records yet. Add a folder and sync to get started.' if not self.indexed else 'No matching rows. Try another keyword or reset filters.'))
+        self.count.setText(f'Showing {start}-{start + len(self.rows) - 1} of {self.total} results' if self.total else ('Type a keyword and press Enter.' if not valid_query(self.query.text()) else 'No matching rows. Try another keyword or reset filters.'))
+        self.result_count.setText(self.count.text())
+        if self.total:
+            self.result_count.setText(self.count.text() + ' · Keywords: ' + ', '.join(value for value, color in self.active_keywords))
         self.update_empty_state()
         if not getattr(self, 'export_busy', False):
             self.export_button.setEnabled(bool(self.total))
@@ -525,6 +637,26 @@ class Window(QMainWindow):
             self.file_title.clear()
             self.detail.setHtml('<h3>No results to display</h3><p>Try a different search or select All files and All worksheets.</p>')
 
+    def table_column_resized(self, column, old, width):
+        if self.rendering_results:
+            return
+        if column < 3:
+            key = ('file', 'sheet', 'row')[column]
+        elif column == 3 + len(self.result_columns):
+            key = 'section'
+        elif column - 3 < len(self.result_columns):
+            key = 'cell:' + self.result_columns[column - 3] + ':' + self.table.horizontalHeaderItem(column).text()
+        else:
+            return
+        self.column_widths[key] = width
+        self.column_resize_timer.start()
+
+    def finish_column_resize(self):
+        self.table.resizeRowsToContents()
+        self.table.update_frozen()
+        self.preferences['column_widths'] = self.column_widths
+        self.save_preferences()
+
     def selected(self):
         selected = self.table.selectionModel().selectedRows()
         index = selected[0].row() if selected else -1
@@ -534,12 +666,14 @@ class Window(QMainWindow):
         if index.isValid():
             self.table.selectRow(index.row())
             self.show_detail()
+            self.detail_drawer.show()
+            self.results_split.setSizes([max(280, self.results_split.width() - 360), 360])
 
     def row_fields(self, row):
         cells = json.loads(row['cells'])
         headers = json.loads(row.get('headers') or '{}')
         columns = sorted(set(cells) | set(headers), key=column_index_from_string)
-        return [(column, headers.get(column) or column, cells.get(column, '')) for column in columns]
+        return [(column, headers.get(column) or f'Column {column}', cells.get(column, '')) for column in columns]
 
     @staticmethod
     def format_sync(value):
@@ -585,25 +719,29 @@ class Window(QMainWindow):
                 timer.start(2000)
 
     def match_preview(self, text):
-        query = self.query.text().strip()
-        terms = query.split() if self.mode.currentText() == 'All Words' else [query]
-        terms = [term for term in terms if term]
-        match = re.search('|'.join(re.escape(term) for term in terms), text, re.IGNORECASE) if terms else None
-        start = max(0, match.start() - 55) if match else 0
-        end = min(len(text), max(start + 240, match.end() if match else 0))
+        spans = match_spans(text, self.query.text())
+        start = max(0, spans[0][0] - 55) if spans else 0
+        end = min(len(text), max(start + 240, spans[0][1] if spans else 0))
         return ('…' if start else '') + text[start:end].replace('\n', ' ') + ('…' if end < len(text) else '')
 
-    def highlight(self, value):
-        terms = self.query.text().strip().split() if self.mode.currentText() == 'All Words' else [self.query.text().strip()]
-        terms = [term for term in terms if term]
-        if not terms:
-            return html.escape(value)
-        pattern = re.compile('|'.join(re.escape(term) for term in sorted(terms, key=len, reverse=True)), re.IGNORECASE)
+    def highlight(self, value, source=None, offset=0):
+        from .chip_input import quoted
+        ranges = []
+        for term, color in getattr(self, 'active_keywords', self.query.keyword_colors()):
+            ranges.extend((begin, end, color) for begin, end in match_spans(source if source is not None else value, quoted(term)))
+        colors = {}
+        for begin, end, color in ranges:
+            for index in range(begin, end):
+                colors.setdefault(index, color)
         parts, start = [], 0
-        for match in pattern.finditer(value):
-            parts.extend([html.escape(value[start:match.start()]), '<span style="background:#ffe08a;color:#111">', html.escape(match.group()), '</span>'])
-            start = match.end()
-        parts.append(html.escape(value[start:]))
+        while start < len(value):
+            color = colors.get(start + offset)
+            end = start + 1
+            while end < len(value) and colors.get(end + offset) == color:
+                end += 1
+            text = html.escape(value[start:end])
+            parts.append(f'<span style="background:{color};color:#111">{text}</span>' if color else text)
+            start = end
         return ''.join(parts)
 
     def show_detail(self):
@@ -615,6 +753,8 @@ class Window(QMainWindow):
             content = f"<p style='color:#52647b;margin:0 0 6px'>{html.escape(row['sheet'])} • Excel row {row['rownum']}" + (' • Hidden worksheet' if row['hidden'] else '') + (' • STALE: source could not be refreshed' if row['stale'] else '') + '</p>'
             wrapped_path = html.escape(row['path']).replace('\\', '\\\u200b').replace('/', '/\u200b').replace('_', '_\u200b')
             content += f"<p style='color:#64748b;font-size:12px;margin:0 0 8px'>{wrapped_path}</p>"
+            if row.get('row_section'):
+                content += '<p><b>Section:</b> ' + self.highlight(row['row_section']) + '</p>'
             fields = self.row_fields(row)
             content += f'<p style="color:#52647b;margin:0 0 8px"><b>Complete row · {len(fields)} fields</b> · Scroll for all values</p>'
             content += '<table width="100%" cellspacing="0" cellpadding="9">'

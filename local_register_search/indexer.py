@@ -4,31 +4,18 @@ import os
 from pathlib import Path
 from .database import connect, normalize
 from .excel_reader import read_rows, Cancelled
+from .search_terms import index_text
+from .sections import contextual_rows
 
 
 def header_rows(records):
-    """Detect known register headings in the first 30 rows, preserving unrecognized sheets."""
-    from itertools import groupby, islice
-    labels = {'s n', 's no', 'sr no', 'serial no', 'date', 'letter no', 'letter number',
-              'subject', 'type', 'description', 'drawing number', 'drawing no', 'code',
-              'received from organization company', 'received from', 'file path', 'reference no'}
-    import re
+    """Use Excel row 1 only as headings, retaining original data row numbers."""
+    from itertools import groupby
     for sheet, group in groupby(records, key=lambda record: record[0]):
-        group = iter(group)
-        prefix = list(islice(group, 30))
         headings = {}
-        header_at = -1
-        for i, record in enumerate(prefix):
-            values = [re.sub(r'[^a-z0-9]+', ' ', value.casefold()).strip() for value in record[3].values()]
-            if len(values) >= 3 and sum(value in labels for value in values) >= 3:
-                header_at, headings = i, record[3]
-                break
-        for record in prefix[header_at + 1:]:
-            if headings and record[3] == headings:
-                continue
-            yield record, headings
         for record in group:
-            if headings and record[3] == headings:
+            if record[1] == 1:
+                headings = record[3]
                 continue
             yield record, headings
 
@@ -108,21 +95,23 @@ def sync(db_path, folders, cancel, progress=lambda *args: None, rebuild=False):
                 try:
                     stat = os.stat(path)
                     old = db.execute('SELECT * FROM files WHERE path=?', (path,)).fetchone()
-                    if old and not old['stale'] and not rebuild and old['mtime'] == stat.st_mtime_ns and old['size'] == stat.st_size:
+                    outdated = db.execute("SELECT 1 FROM rows WHERE path=? AND (row_text IS NULL OR row_text='' OR row_section IS NULL) LIMIT 1", (path,)).fetchone()
+                    if old and not old['stale'] and not rebuild and not outdated and old['mtime'] == stat.st_mtime_ns and old['size'] == stat.st_size:
                         summary['skipped'] += 1
                         continue
                     with db:
                         db.execute('DELETE FROM rows WHERE path=?', (path,))
                         db.execute('DELETE FROM sheet_headers WHERE path=?', (path,))
                         saved_sheets = set()
-                        for (sheet, row, hidden, cells), headers in header_rows(read_rows(path, cancel)):
+                        for (sheet, row, hidden, cells), headers, section in contextual_rows(read_rows(path, cancel, with_context=True)):
                             if sheet not in saved_sheets:
                                 db.execute('INSERT OR REPLACE INTO sheet_headers VALUES(?,?,?)',
                                            (path, sheet, json.dumps(headers, ensure_ascii=False)))
                                 saved_sheets.add(sheet)
                             text = ' | '.join(cells.values())
-                            db.execute('INSERT INTO rows(path,sheet,rownum,hidden,cells,text,normalized) VALUES(?,?,?,?,?,?,?)',
-                                       (path, sheet, row, hidden, json.dumps(cells, ensure_ascii=False), text, normalize(text)))
+                            row_text, row_digits = index_text(cells)
+                            db.execute('INSERT INTO rows(path,sheet,rownum,hidden,cells,text,normalized,row_text,row_digits,row_section) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                                       (path, sheet, row, hidden, json.dumps(cells, ensure_ascii=False), text, normalize(text), row_text, row_digits, section))
                         after = os.stat(path)
                         if cancel.is_set():
                             raise Cancelled()

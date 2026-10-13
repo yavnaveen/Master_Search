@@ -33,4 +33,15 @@ def connect(path):
     CREATE TABLE IF NOT EXISTS sheet_headers(path TEXT, sheet TEXT, headers TEXT,
       PRIMARY KEY(path,sheet));
     ''')
+    columns = {row['name'] for row in db.execute('PRAGMA table_info(rows)')}
+    with db:
+        for name in ('row_text', 'row_digits'):
+            if name not in columns:
+                db.execute(f"ALTER TABLE rows ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+        if 'row_section' not in columns:
+            db.execute('ALTER TABLE rows ADD COLUMN row_section TEXT')
     return db
+
+
+def needs_search_update(db):
+    return bool(db.execute("SELECT 1 FROM rows WHERE row_text IS NULL OR row_text='' OR row_section IS NULL LIMIT 1").fetchone())
