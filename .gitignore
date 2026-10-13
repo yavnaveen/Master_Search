@@ -1,0 +1,17 @@
+.venv/
+.bootstrap/
+installed.flag
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.sqlite
+*.sqlite3
+build/
+dist/
+*.spec
+.idea/
+.vscode/

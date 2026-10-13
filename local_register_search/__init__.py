@@ -1,0 +1,1 @@
+"""Offline Excel register search."""
