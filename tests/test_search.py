@@ -104,6 +104,52 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(match_spans('13 Oct 2026', '13/10/2026'), [(0, 11)])
         self.assertEqual(match_spans('Straße', 'STRASSE'), [(0, 6)])
 
+    def test_search_requires_synced_backend_records(self):
+        from PySide6.QtWidgets import QApplication
+        from local_register_search.ui import Window
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        app = QApplication.instance() or QApplication([])
+        profile = self.root / 'empty-profile'
+        profile.mkdir()
+        with patch('local_register_search.ui.data_dir', return_value=profile):
+            window = Window()
+        self.addCleanup(window.close)
+        self.assertEqual(window.empty_title.text(), 'No searchable data')
+        self.assertIn('add a folder', window.empty_message.text())
+        self.assertIn('color:#b42318', window.empty_message.styleSheet())
+        self.assertEqual(window.result_count.text(), '')
+        self.assertEqual(window.count.text(), '')
+        window.set_dark_mode(True)
+        self.assertIn('color:#ffb4ab', window.empty_message.styleSheet())
+        window.set_dark_mode(False)
+        window.query.setText('rishikesh')
+        window.indexed = 100  # A stale UI count must not permit an empty backend search.
+        with patch.object(window, 'launch') as launch:
+            window.submit_search()
+            launch.assert_not_called()
+        self.assertEqual(window.table.rowCount(), 0)
+        self.assertNotIn('No matching', window.result_count.text())
+        self.assertEqual(window.result_count.text(), '')
+        self.assertEqual(window.count.text(), '')
+        self.assertFalse(window.export_button.isEnabled())
+        self.assertTrue(all(not button.isEnabled() for button in window.page_buttons))
+        window.folders = [str(self.root)]
+        window.update_empty_state()
+        self.assertIn('Click Sync files', window.empty_message.text())
+        window.scanning = True
+        window.update_empty_state()
+        self.assertIn('Files are syncing', window.empty_message.text())
+        window.scanning = False
+        sync(window.path, [str(self.root)], threading.Event())
+        window.refresh_filters()
+        with patch.object(window, 'launch') as launch:
+            window.submit_search()
+            launch.assert_called_once()
+        self.assertNotIn('color:#b42318', window.result_count.styleSheet())
+        window.search_busy = False
+        window.search_done(window.generation, (0, []))
+        self.assertIn('No matching rows', window.result_count.text())
+
     def test_window_empty_state_paging_sync_and_migration(self):
         os.environ['QT_QPA_PLATFORM'] = 'offscreen'
         from PySide6.QtWidgets import QApplication
@@ -275,7 +321,8 @@ class SearchTests(unittest.TestCase):
         self.addCleanup(window.close)
         window.search_done(window.generation, (3, mixed))
         self.assertEqual(window.table.horizontalHeaderItem(3).text(), 'Column A')
-        self.assertEqual(window.table.horizontalHeaderItem(window.table.columnCount() - 1).text(), 'Section')
+        self.assertEqual(window.table.horizontalHeaderItem(window.table.columnCount() - 2).text(), 'Section')
+        self.assertEqual(window.table.horizontalHeaderItem(window.table.columnCount() - 1).text(), 'Open')
         client_index = next(i for i, row in enumerate(mixed) if row['row_section'] == 'B - Client Data')
         self.assertEqual(window.row_fields(mixed[client_index])[0][1], 'Field')
         window.select_record(window.table.model().index(client_index, 0))
@@ -350,6 +397,69 @@ class SearchTests(unittest.TestCase):
         bar.enter()
         self.assertEqual(parse_query(bar.text()), ['a'])
 
+    def test_referenced_file_links_only_for_file_cells(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtWidgets import QApplication
+        from local_register_search.ui import Window
+        from local_register_search.desktop_features import referenced_file
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        app = QApplication.instance() or QApplication([])
+        pdf = self.root / 'drawing.pdf'
+        pdf.write_bytes(b'%PDF-1.4')
+        self.assertIsNone(referenced_file('N/A', self.root / 'register.xlsx'))
+        self.assertIsNone(referenced_file('Company Pvt. Ltd', self.root / 'register.xlsx'))
+        self.assertEqual(referenced_file('drawing.pdf', self.root / 'register.xlsx'), pdf)
+        with patch('local_register_search.ui.data_dir', return_value=self.root):
+            window = Window()
+        self.addCleanup(window.close)
+        row = search(self.db_path, 'rishikesh')[1][0]
+        row['cells'] = json.dumps({'A': 'N/A', 'B': str(pdf), 'C': 'Company Pvt. Ltd'})
+        window.search_done(window.generation, (1, [row]))
+        self.assertNotIn('Open file', window.detail.toPlainText())
+        self.assertFalse(window.open_file_button.isHidden())
+        window.select_record(window.table.model().index(0, 0))
+        window.show()
+        app.processEvents()
+        self.assertEqual({button.height() for button in window.record_buttons}, {28})
+        primary, *secondary = window.record_buttons
+        self.assertLessEqual(max(button.width() for button in secondary) - min(button.width() for button in secondary), 1)
+        self.assertGreater(primary.width(), secondary[0].width())
+        self.assertLess(primary.y(), window.open_file_button.y())
+        self.assertLess(window.open_file_button.y(), window.detail.y())
+        self.assertEqual(window.detail_file_paths, {'B': pdf})
+        with patch('local_register_search.ui.QDesktopServices.openUrl', return_value=True) as opened:
+            window.open_file_button.click()
+            opened.assert_called_once_with(QUrl.fromLocalFile(str(pdf)))
+        with patch('local_register_search.ui.QDesktopServices.openUrl') as opened:
+            window.open_referenced_file(QUrl('record-file:A'))
+            opened.assert_not_called()
+        row['cells'] = json.dumps({'A': 'N/A'})
+        window.search_done(window.generation, (1, [row]))
+        self.assertTrue(window.open_file_button.isHidden())
+        row['cells'] = json.dumps({'A': 'needle', 'B': 'NOTE: ' + 'long note text ' * 30})
+        row['headers'] = json.dumps({'A': 'Name', 'B': 'Note'})
+        window.search_done(window.generation, (1, [row]))
+        window.field_filter.setText('needle')
+        self.assertIn('needle', window.detail.toPlainText())
+        self.assertNotIn('long note text', window.detail.toPlainText())
+        self.assertEqual(window.field_count.text(), '1 of 2 fields')
+        window.field_filter.clear()
+        self.assertIn('Show more', window.detail.toPlainText())
+        window.detail_link_clicked(QUrl('expand-note:B'))
+        self.assertIn('Show less', window.detail.toPlainText())
+        self.assertIn('long note text ' * 30, window.detail.toPlainText())
+        header_note = 'NOTE: If a hyperlink is not opening, please change the default application from Chrome to a specific PDF viewer. ' * 4
+        row['headers'] = json.dumps({'A': header_note})
+        row['cells'] = json.dumps({'A': '3999'})
+        window.search_done(window.generation, (1, [row]))
+        rendered = window.detail.toHtml()
+        self.assertIn('colspan="2"', rendered)
+        self.assertIn('Column A', window.detail.toPlainText())
+        self.assertIn('3999', window.detail.toPlainText())
+        self.assertIn('Show more', window.detail.toPlainText())
+        window.detail_link_clicked(QUrl('expand-note:A:header'))
+        self.assertIn(header_note.strip(), window.detail.toPlainText())
+
     def test_table_readability_and_saved_widths(self):
         os.environ['QT_QPA_PLATFORM'] = 'offscreen'
         from PySide6.QtCore import Qt
@@ -379,11 +489,24 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(window.table.item(0, 3).textAlignment() & Qt.AlignmentFlag.AlignLeft)
         font = window.table.font()
         lines = window.match_delegate.visible_lines(long_text, font, 110, 3)
-        self.assertEqual(len(lines), 3)
-        self.assertTrue(lines[-1].endswith('...'))
-        self.assertGreater(window.table.rowHeight(0), 40)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[-1].endswith('…'))
+        self.assertGreaterEqual(window.table.rowHeight(0), 18)
+        self.assertLessEqual(window.table.rowHeight(0), 22)
         self.assertEqual(window.table.rowHeight(0), window.table.frozen.rowHeight(0))
         self.assertEqual(window.table.item(0, 3).toolTip(), long_text)
+        window.table.setColumnWidth(0, 400)
+        self.assertLessEqual(window.table.columnWidth(0), 260)
+        open_button = window.table.cellWidget(0, window.table.columnCount() - 1)
+        with patch.object(window, 'open_path') as open_path:
+            open_button.click()
+            open_path.assert_called_once_with(False, row)
+        existing_row = dict(row, path=str(self.root / 'register.xlsx'))
+        with patch('local_register_search.desktop_features.open_excel_record', return_value=False) as jump, \
+             patch('local_register_search.ui.QDesktopServices.openUrl', return_value=True) as fallback:
+            window.open_path(False, existing_row)
+            jump.assert_called_once_with(Path(existing_row['path']), existing_row['sheet'], existing_row['rownum'])
+            fallback.assert_called_once()
         filename = Path(row['path']).name
         elided = window.match_delegate.visible_lines(filename, font, 120, 0)[0]
         self.assertNotEqual(elided, filename)
@@ -400,6 +523,32 @@ class SearchTests(unittest.TestCase):
         self.addCleanup(reopened.close)
         reopened.search_done(reopened.generation, (1, [row]))
         self.assertEqual(reopened.table.columnWidth(3), 330)
+
+    def test_dark_theme_page_backgrounds_and_button_colors(self):
+        from PySide6.QtWidgets import QApplication, QLabel
+        from local_register_search.ui import Window
+        os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+        app = QApplication.instance() or QApplication([])
+        with patch('local_register_search.ui.data_dir', return_value=self.root):
+            window = Window()
+        self.addCleanup(window.close)
+        window.show()
+        for dark, expected in [(True, '#111e2a'), (False, '#f8fafb'), (True, '#111e2a')]:
+            window.set_dark_mode(dark)
+            for index in (1, 2, 3):
+                window.show_tab(index)
+                app.processEvents()
+                content = window.pages.widget(index).widget()
+                image = content.grab().toImage()
+                self.assertEqual(image.pixelColor(image.width() - 3, image.height() - 3).name(), expected)
+            online = next(label for label in window.findChildren(QLabel) if 'Offline' in label.text())
+            self.assertIn('#74db99', online.styleSheet())
+        window.clear_all_button.setEnabled(True)
+        app.processEvents()
+        image = window.clear_all_button.grab().toImage()
+        self.assertEqual(image.pixelColor(5, image.height() // 2).name(), '#462d35')
+        danger = next(label for label in window.findChildren(QLabel) if label.text() == 'Danger zone')
+        self.assertIn('#ffb4ab', danger.styleSheet())
 
     def test_top_navigation_drawer_responsive_and_confirmations(self):
         os.environ['QT_QPA_PLATFORM'] = 'offscreen'
@@ -437,13 +586,15 @@ class SearchTests(unittest.TestCase):
         window.select_record(window.table.model().index(0, 0))
         app.processEvents()
         self.assertFalse(window.detail_drawer.isHidden())
-        self.assertIn('Name:', window.detail.toPlainText())
+        self.assertIn('Name', window.detail.toPlainText())
         window.drawer_close.click()
         self.assertTrue(window.detail_drawer.isHidden())
         window.resize(640, 600)
         app.processEvents()
         top = window.findChild(type(window.centralWidget()), 'topbar')
-        self.assertGreater(top.height(), 58)
+        self.assertGreaterEqual(top.height(), 40)
+        for control in window.nav_buttons:
+            self.assertLessEqual(control.mapTo(top, control.rect().bottomRight()).x(), top.width())
         self.assertLessEqual(window.query.geometry().right(), window.query.parentWidget().width())
         with patch('local_register_search.ui.QMessageBox.question', return_value=QMessageBox.StandardButton.No) as confirm:
             window.delete_folder_data()

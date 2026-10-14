@@ -1,12 +1,12 @@
 """Desktop layout for the local register browser."""
 import html
-import math
 from PySide6.QtCore import Qt, QVariantAnimation, QEasingCurve, QRectF, QEvent, QPointF, QSize, QRect, QPoint, QTimer
-from PySide6.QtGui import QTextDocument, QTextLayout, QTextOption, QFontMetrics, QAbstractTextDocumentLayout, QPalette, QPainter, QColor, QPen, QPolygonF, QPixmap, QIcon
+from PySide6.QtGui import QTextDocument, QTextOption, QTextCursor, QTextBlockFormat, QFontMetrics, QAbstractTextDocumentLayout, QPalette, QPainter, QColor, QPen, QPolygonF, QPixmap, QIcon
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QLineEdit, QComboBox, QSplitter, QTableWidget, QTextBrowser,
     QProgressBar, QFrame, QMessageBox, QDialog, QStyledItemDelegate, QStyle, QHeaderView,
     QStyleOptionViewItem, QTableView, QGridLayout, QCheckBox, QLayout, QStackedWidget, QScrollArea, QSizePolicy)
+from .filter_dropdown import ContentCombo
 
 
 class WrapLayout(QLayout):
@@ -71,10 +71,15 @@ class WrapLayout(QLayout):
 
 DARK_STYLE = '''
     QWidget { color: #d8e5ed; }
-    QMainWindow, QWidget#root, QDialog { background: #111e2a; }
+    QMainWindow, QWidget#root, QDialog, QStackedWidget,
+    QScrollArea, QWidget#pageContent, QWidget#pageViewport { background: #111e2a; }
     QFrame#card { background: #1b2d3d; border-color: #385064; }
     QPushButton { background: #22394a; color: #d8e5ed; border-color: #5d9daf; }
     QPushButton:hover { background: #31546a; }
+    QPushButton#primary { background: #167084; color: #ffffff; border-color: #167084; }
+    QPushButton#primary:hover { background: #125e70; }
+    QPushButton#danger { background: #462d35; color: #ffb4ab; border-color: #a94b4b; }
+    QPushButton#danger:hover { background: #603842; }
     QPushButton:disabled { background: #1a2a38; color: #8295a5; border-color: #344b5d; }
     QPushButton#primary:disabled, QPushButton#danger:disabled { background: #1a2a38; color: #8295a5; border-color: #344b5d; }
     QLineEdit, QComboBox, QComboBox[filterControl="true"] { background: #22394a; color: #e5eff5; border-color: #52768a; }
@@ -83,7 +88,9 @@ DARK_STYLE = '''
     QHeaderView::section { background: #294152; color: #d8e5ed; border-color: #385064; }
     QTextBrowser { background: #1b2d3d; color: #d8e5ed; }
     QSplitter::handle { background: #111e2a; }
-    QCheckBox { spacing: 10px; padding: 10px; }
+    QCheckBox { color: #d8e5ed; }
+    QScrollBar { background: #1b2d3d; }
+    QScrollBar::handle { background: #52768a; border-radius: 4px; min-width: 16px; min-height: 16px; }
     QListWidget#folderList {color:#d8e5ed;background:#1b2d3d;border-color:#385064;}
 '''
 
@@ -117,6 +124,10 @@ def action_icon(name, color='#58a6b7'):
         painter.drawLine(10, 2, 10, 12)
         painter.drawPolyline(QPolygonF([QPointF(6, 8), QPointF(10, 12), QPointF(14, 8)]))
         painter.drawPolyline(QPolygonF([QPointF(3, 12), QPointF(3, 17), QPointF(17, 17), QPointF(17, 12)]))
+    elif name == 'Open':
+        painter.drawPolyline(QPolygonF([QPointF(10, 3), QPointF(17, 3), QPointF(17, 10)]))
+        painter.drawLine(8, 12, 17, 3)
+        painter.drawPolyline(QPolygonF([QPointF(7, 3), QPointF(3, 3), QPointF(3, 17), QPointF(17, 17), QPointF(17, 13)]))
     else:
         painter.drawRoundedRect(QRectF(4, 2, 12, 16), 1, 1)
         painter.drawLine(7, 7, 13, 7)
@@ -125,13 +136,13 @@ def action_icon(name, color='#58a6b7'):
     return QIcon(pixmap)
 
 
-class FilterCombo(QComboBox):
+class FilterCombo(ContentCombo):
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor('#126175'), 1.8))
-        x, y = self.width() - 18, self.height() / 2
+        x, y = self.width() - 9, self.height() / 2
         painter.drawPolyline(QPolygonF([QPointF(x - 4, y - 2), QPointF(x, y + 2), QPointF(x + 4, y - 2)]))
         painter.end()
 
@@ -232,37 +243,9 @@ class MatchDelegate(QStyledItemDelegate):
 
     def visible_lines(self, value, font, width, column):
         metrics = QFontMetrics(font)
-        if column == 0:
-            return [metrics.elidedText(value, Qt.TextElideMode.ElideMiddle, width)]
-        lines = []
-        paragraphs = value.split('\n')
-        for paragraph_index, paragraph in enumerate(paragraphs):
-            layout = QTextLayout(paragraph or ' ', font)
-            wrapping = QTextOption()
-            wrapping.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
-            layout.setTextOption(wrapping)
-            layout.beginLayout()
-            while True:
-                line = layout.createLine()
-                if not line.isValid():
-                    break
-                line.setLineWidth(width)
-                start, length = line.textStart(), line.textLength()
-                if len(lines) == 2:
-                    remaining = ' '.join([paragraph[start:]] + paragraphs[paragraph_index + 1:])
-                    if length < len(paragraph) - start or paragraph_index < len(paragraphs) - 1:
-                        suffix = '...'
-                        text = paragraph[start:start + length].rstrip()
-                        while text and metrics.horizontalAdvance(text + suffix) > width:
-                            text = text[:-1]
-                        lines.append(text + suffix)
-                    else:
-                        lines.append(paragraph[start:start + length])
-                    layout.endLayout()
-                    return lines
-                lines.append(paragraph[start:start + length])
-            layout.endLayout()
-        return lines or ['-']
+        return [metrics.elidedText(value.replace('\n', ' ').replace('\r', ' '),
+                                  Qt.TextElideMode.ElideMiddle if column == 0 else Qt.TextElideMode.ElideRight,
+                                  max(1, width))]
 
     def document(self, value, font, width, column, alignment, highlight=True):
         doc = QTextDocument()
@@ -282,16 +265,20 @@ class MatchDelegate(QStyledItemDelegate):
                 fragments[-1] += '...'
             if position >= 0:
                 cursor = position + len(shown)
-        content = '<br>'.join(fragments)
+        content = f'</p><p style="margin:0;text-align:{align}">'.join(fragments)
         doc.setHtml(f'<p style="margin:0;text-align:{align}">{content}</p>')
+        cursor = QTextCursor(doc)
+        cursor.select(QTextCursor.SelectionType.Document)
+        block = QTextBlockFormat()
+        block.setLineHeight(100, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        cursor.mergeBlockFormat(block)
         doc.setTextWidth(max(1, width))
         return doc
 
     def sizeHint(self, option, index):
         self.initStyleOption(option, index)
         width = self.window.table.columnWidth(index.column())
-        doc = self.document(option.text, option.font, width - 20, index.column(), option.displayAlignment)
-        return QSize(width, max(40, math.ceil(doc.size().height()) + 16))
+        return QSize(width, max(18, option.fontMetrics.height() + 2))
 
     def paint(self, painter, option, index):
         self.initStyleOption(option, index)
@@ -305,7 +292,7 @@ class MatchDelegate(QStyledItemDelegate):
         if not self.window.dark_mode:
             color = '#E6F4F2' if selected else '#F0F8F7' if index.row() == self.window.table.hover_row else '#fbfcfd' if index.row() % 2 else '#ffffff'
             painter.fillRect(option.rect, QColor(color))
-        rect = option.rect.adjusted(10, 8, -10, -8)
+        rect = option.rect.adjusted(6, 1, -6, -1)
         doc = self.document(value, option.font, rect.width(), index.column(), option.displayAlignment, index.data(Qt.ItemDataRole.UserRole) not in ('metadata', 'empty-cell'))
         if index.data(Qt.ItemDataRole.UserRole) == 'empty-cell':
             doc.setHtml('<p style="margin:0">-</p>')
@@ -319,11 +306,11 @@ class MatchDelegate(QStyledItemDelegate):
 
 
 def build(window):
-    window.resize(1500, 940)
+    window.resize(1120, 940)
     window.setMinimumSize(640, 520)
     window.setStyleSheet('''
-        QWidget { font-family: "Segoe UI"; font-size: 14px; color: #142338; }
-        QMainWindow, QWidget#root { background: #f8fafb; }
+        QWidget { font-family: "Segoe UI"; font-size: 12px; color: #142338; }
+        QMainWindow, QWidget#root, QWidget#pageContent, QWidget#pageViewport { background: #f8fafb; }
         QWidget#topbar { background: #142839; }
         QWidget#topbar QLabel { color: #c6d2de; background: transparent; }
         QWidget#topbar QPushButton { color: #eff6fa; background: transparent; border: none; text-align: left; padding: 13px; }
@@ -347,16 +334,17 @@ def build(window):
         QLineEdit, QComboBox { background: white; border: 1px solid #c7d2dd; border-radius: 6px; padding: 10px; }
         QLineEdit:focus, QComboBox:focus { border-color: #167084; }
         QComboBox QAbstractItemView { background: white; selection-background-color: #def1f3; selection-color: #142338; }
-        QComboBox[filterControl="true"] { background: #e6f3f5; color: #126175; border: 1px solid #7fb1bd; border-radius: 10px; padding: 10px 36px 10px 14px; font-weight: 600; }
+        QComboBox[filterControl="true"] { background: #e6f3f5; color: #126175; border: 1px solid #7fb1bd; border-radius: 5px; padding: 4px 8px; }
         QComboBox[filterControl="true"]:hover { background: #d7ecef; border-color: #167084; }
-        QComboBox[filterControl="true"]:focus { background: #def1f3; border: 2px solid #167084; padding: 9px 35px 9px 13px; }
-        QComboBox[filterControl="true"]::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 30px; border: none; background: transparent; }
+        QComboBox[filterControl="true"]:focus { background: #def1f3; border: 2px solid #167084; padding: 3px 7px; }
+        QComboBox[filterControl="true"]::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 16px; border: none; background: transparent; }
         QComboBox[filterControl="true"]::down-arrow { image: none; }
         QComboBox[filterControl="true"] QAbstractItemView { background: #f8fafb; color: #126175; border: 1px solid #7fb1bd; padding: 4px; selection-background-color: #167084; selection-color: white; }
         QFrame#card { background: white; border: 1px solid #dbe3eb; border-radius: 7px; }
         QTableView { background: white; alternate-background-color: #fbfcfd; border: none; selection-background-color: #E6F4F2; selection-color: #0c1c30; }
-        QTableWidget::item { padding: 8px; border-bottom: 1px solid #e8edf2; }
-        QHeaderView::section { background: #f2f6f8; border: none; border-bottom: 1px solid #dbe3eb; padding: 12px; color: #35465c; }
+        QTableView { font-size:12px; }
+        QTableWidget::item { padding: 1px 6px; border-bottom: 1px solid #e8edf2; }
+        QHeaderView::section { background: #f2f6f8; border: none; border-bottom: 1px solid #dbe3eb; padding: 3px 6px; color: #35465c; font-size:12px; font-weight:normal; }
         QTextBrowser { background: white; border: none; padding: 8px; }
         QListWidget { border: none; background: transparent; color: #edf4f8; }
         QListWidget::item { padding: 12px 8px; }
@@ -369,6 +357,7 @@ def build(window):
     window.setStyleSheet(window.styleSheet() + '''
         QWidget#topbar QLabel {font-weight:600;}
         QWidget#topbar QPushButton {padding:8px 14px;text-align:center;}
+        QPushButton[compactControl="true"], QWidget#topbar QPushButton[compactControl="true"] {padding:4px 8px;}
         QListWidget#folderList {color:#142338;background:white;border:1px solid #dbe3eb;border-radius:7px;}
         QListWidget#folderList::item:selected {color:white;background:#205e70;}
     ''')
@@ -384,7 +373,8 @@ def build(window):
     def button(name, action, layout, primary=False):
         item = QPushButton(name)
         item.setCursor(Qt.CursorShape.PointingHandCursor)
-        item.setMinimumHeight(40)
+        item.setProperty('compactControl', True)
+        item.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         item.setIconSize(QSize(18, 18))
         item.setIcon(action_icon(name, '#e0edf4' if primary else '#58a6b7'))
         if primary:
@@ -398,15 +388,15 @@ def build(window):
     top.setObjectName('topbar')
     top.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
     top_layout = WrapLayout(top)
-    top_layout.setContentsMargins(24, 8, 24, 8)
+    top_layout.setContentsMargins(14, 6, 14, 6)
     outer.addWidget(top)
     brand = QWidget()
     branding = QHBoxLayout(brand)
-    branding.setContentsMargins(0, 0, 14, 0)
-    logo = QLabel('LR')
-    logo.setStyleSheet('background:#167084;color:white;font-weight:700;border-radius:9px;padding:10px;')
+    branding.setContentsMargins(0, 0, 4, 0)
+    logo = QLabel('MR')
+    logo.setStyleSheet('background:#167084;color:white;font-weight:700;border-radius:6px;padding:7px;')
     branding.addWidget(logo)
-    branding.addWidget(QLabel('Local Register Search'))
+    branding.addWidget(QLabel('Master Register Search'))
     top_layout.addWidget(brand)
     window.nav_buttons = []
     tabs = QWidget()
@@ -417,10 +407,12 @@ def build(window):
     for index, name in enumerate(('Search', 'Folders', 'Sync status', 'Settings')):
         tab = button(name, lambda checked=False, i=index: window.show_tab(i), navigation)
         tab.setCheckable(True)
+        tab.setIcon(QIcon())
         window.nav_buttons.append(tab)
     offline = QLabel('● Offline · Local files only')
     offline.setProperty('alignRight', True)
-    offline.setStyleSheet('color:#74db99;font-size:13px;padding:8px;')
+    offline.setText('● Offline · Local files only')
+    offline.setStyleSheet('color:#74db99;font-size:11px;padding:7px;')
     top_layout.addWidget(offline)
 
     window.sync_panel = QWidget()
@@ -449,22 +441,24 @@ def build(window):
 
     search_page = QWidget()
     layout = QVBoxLayout(search_page)
-    layout.setContentsMargins(24, 20, 24, 20)
-    layout.setSpacing(14)
+    layout.setContentsMargins(14, 10, 14, 8)
+    layout.setSpacing(8)
     window.pages.addWidget(search_page)
     searchbar = QHBoxLayout()
     from .chip_input import ChipInput
     window.query = ChipInput()
-    window.query.setMinimumHeight(48)
-    window.query.setStyleSheet('font-size:18px;')
+    window.query.setMinimumHeight(34)
     searchbar.addWidget(window.query, 1)
     search_button = button('Search', window.submit_search, searchbar, True)
-    search_button.setMinimumSize(110, 48)
+    search_button.setIcon(QIcon())
+    search_button.setFixedHeight(32)
+    search_button.setStyleSheet('padding:4px 14px;')
     window.query.searchRequested.connect(window.submit_search)
     layout.addLayout(searchbar)
 
     filter_container = QWidget()
     filters = WrapLayout(filter_container)
+    filters.setSpacing(8)
     from .filter_dropdown import SearchableCombo
     window.folder_filter = SearchableCombo('No folders found')
     window.folder_filter.setToolTip('Select a register folder to manage it in Folders or Settings. Use File and Worksheet to filter results.')
@@ -479,25 +473,19 @@ def build(window):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
         row.addWidget(QLabel(label))
-        combo.setMinimumWidth(120)
-        combo.setMaximumWidth(200)
-        combo.setMinimumHeight(40)
+        group.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         combo.setProperty('filterControl', True)
         row.addWidget(combo)
         filters.addWidget(group)
     window.index_summary = QLabel()
-    window.index_summary.setStyleSheet('color:#52647b;font-size:12px;')
+    window.index_summary.setStyleSheet('color:#52647b;font-size:10px;')
     window.index_summary.setMaximumWidth(280)
     window.index_summary.setWordWrap(True)
-    filter_actions = QWidget()
-    filter_actions.setProperty('alignRight', True)
-    action_row = QHBoxLayout(filter_actions)
-    action_row.setContentsMargins(0, 0, 0, 0)
-    action_row.setSpacing(10)
-    action_row.addWidget(window.index_summary)
+    filters.addWidget(window.index_summary)
     for name, action in [('Add folder', window.add_folder), ('Sync files', lambda: window.start_sync(False))]:
-        window.controls.append(button(name, action, action_row))
-    filters.addWidget(filter_actions)
+        item = button(name, action, filters)
+        item.setIcon(QIcon())
+        window.controls.append(item)
     layout.addWidget(filter_container)
     # Recent-search storage and shortcuts are retained; the picker lives in Settings.
     window.recent = QComboBox()
@@ -505,20 +493,25 @@ def build(window):
     window.recent.currentIndexChanged.connect(window.use_recent_search)
 
     window.results_split = QSplitter(Qt.Orientation.Horizontal)
+    window.results_split.setHandleWidth(10)
     layout.addWidget(window.results_split, 1)
     results = QFrame()
     results.setObjectName('card')
     result_layout = QVBoxLayout(results)
     result_layout.setContentsMargins(0, 0, 0, 0)
     result_header = QHBoxLayout()
-    result_header.setContentsMargins(18, 10, 18, 10)
+    result_header.setContentsMargins(12, 8, 12, 8)
     title = QLabel('Search results ·')
-    title.setStyleSheet('font-size:18px;font-weight:600;')
+    title.setText('Search results')
+    title.setStyleSheet('font-size:13px;font-weight:600;')
     result_header.addWidget(title)
     window.result_count = QLabel()
+    window.result_count.setStyleSheet('font-size:10px;color:#52647b;')
     window.result_count.setWordWrap(True)
     result_header.addWidget(window.result_count, 1)
     window.export_button = button('Export results', window.export_results, result_header)
+    window.export_button.setIcon(QIcon())
+    window.export_button.setFixedHeight(26)
     window.export_button.setEnabled(False)
     window.export_button.setToolTip('Export all matching rows to Excel or CSV')
     result_layout.addLayout(result_header)
@@ -529,12 +522,18 @@ def build(window):
     window.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     window.table.setAlternatingRowColors(True)
     window.table.setShowGrid(False)
-    window.table.setWordWrap(True)
+    window.table.setWordWrap(False)
     window.table.verticalHeader().hide()
-    window.table.verticalHeader().setDefaultSectionSize(48)
+    window.table.verticalHeader().setMinimumSectionSize(18)
+    window.table.verticalHeader().setMaximumSectionSize(22)
+    window.table.verticalHeader().setDefaultSectionSize(20)
+    window.table.frozen.verticalHeader().setMinimumSectionSize(18)
+    window.table.frozen.verticalHeader().setMaximumSectionSize(22)
     for column, width in enumerate((220, 130, 55)):
         window.table.setColumnWidth(column, width)
     for table_header in (window.table.horizontalHeader(), window.table.frozen.horizontalHeader()):
+        table_header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        table_header.setFixedHeight(26)
         table_header.setSectionsClickable(True)
         table_header.setSortIndicatorShown(True)
         table_header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
@@ -580,36 +579,85 @@ def build(window):
 
     window.detail_drawer = QFrame()
     window.detail_drawer.setObjectName('card')
+    window.detail_drawer.setMinimumWidth(300)
+    window.detail_drawer.setMaximumWidth(330)
     detail_layout = QVBoxLayout(window.detail_drawer)
-    detail_layout.setContentsMargins(14, 12, 14, 12)
+    detail_layout.setContentsMargins(8, 10, 8, 10)
+    detail_layout.setSpacing(6)
     drawer_header = QHBoxLayout()
     drawer_title = QLabel('Record details')
-    drawer_title.setStyleSheet('font-size:18px;font-weight:600;')
+    drawer_title.setStyleSheet('font-size:13px;font-weight:600;')
     drawer_header.addWidget(drawer_title, 1)
     window.drawer_close = button('×', window.detail_drawer.hide, drawer_header)
     window.drawer_close.setAccessibleName('Close record details')
     window.drawer_close.setToolTip('Close record details')
-    window.drawer_close.setFixedWidth(42)
+    window.drawer_close.setFixedSize(24, 24)
+    window.drawer_close.setIcon(QIcon())
+    window.drawer_close.setText('×')
+    window.drawer_close.setStyleSheet('padding:0;border:none;background:transparent;')
     detail_layout.addLayout(drawer_header)
     window.file_title = QLabel()
     window.file_title.setMinimumWidth(0)
+    window.file_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+    window.file_title.setStyleSheet('font-size:11px;color:#52647b;')
     detail_layout.addWidget(window.file_title)
     window.detail = QTextBrowser()
     window.detail.setOpenExternalLinks(False)
+    window.detail.setOpenLinks(False)
+    window.detail.anchorClicked.connect(window.detail_link_clicked)
+    window.detail.setStyleSheet('padding:0;font-size:12px;')
     window.detail.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
-    detail_layout.addWidget(window.detail, 1)
     record_grid = QGridLayout()
+    record_grid.setContentsMargins(0, 2, 4, 2)
+    record_grid.setHorizontalSpacing(6)
+    record_grid.setVerticalSpacing(6)
+    record_grid.setColumnStretch(0, 1)
+    record_grid.setColumnStretch(1, 1)
     window.record_buttons = []
-    for i, (name, action, primary) in enumerate([
-        ('Open Excel file', lambda: window.open_path(False), True),
-        ('Open folder', lambda: window.open_path(True), False),
-        ('Copy path', window.copy_path, False), ('Copy row', window.copy_row, False)]):
+    for name, action, primary, grid_row, grid_column, span in [
+        ('Open Excel file', lambda: window.open_path(False), True, 0, 0, 2),
+        ('Open file', lambda: window.open_referenced_file(), False, 1, 0, 1),
+        ('Open folder', lambda: window.open_path(True), False, 1, 1, 1),
+        ('Copy path', window.copy_path, False, 2, 0, 1),
+        ('Copy row', window.copy_row, False, 2, 1, 1)]:
         slot = QHBoxLayout()
         item = button(name, action, slot, primary)
         item.setProperty('actionLabel', name)
-        record_grid.addLayout(slot, i // 2, i % 2)
+        item.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        item.setFixedHeight(28)
+        item.setIconSize(QSize(14, 14))
+        item.setStyleSheet('padding:4px 8px;font-size:12px;')
+        item.setIcon(action_icon('Open' if name == 'Open file' else name,
+                                 '#ffffff' if primary else '#126175' if name.startswith('Open') else '#142338'))
+        item.setIcon(QIcon())
+        slot.takeAt(0)
+        record_grid.addWidget(item, grid_row, grid_column, 1, span)
         window.record_buttons.append(item)
+        if name == 'Open file':
+            window.open_file_button = item
+            item.hide()
+    secondary_width = max(item.sizeHint().width() for item in window.record_buttons[1:])
+    record_grid.setColumnMinimumWidth(0, secondary_width)
+    record_grid.setColumnMinimumWidth(1, secondary_width)
     detail_layout.addLayout(record_grid)
+    window.record_meta = QLabel()
+    window.record_meta.setWordWrap(True)
+    window.record_meta.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+    window.record_meta.setFixedHeight(48)
+    window.record_meta.setStyleSheet('color:#52647b;font-size:11px;padding:2px 0;')
+    detail_layout.addWidget(window.record_meta)
+    field_header = QHBoxLayout()
+    window.field_count = QLabel('0 fields')
+    window.field_count.setStyleSheet('font-weight:600;font-size:11px;')
+    window.field_filter = QLineEdit()
+    window.field_filter.setPlaceholderText('Filter fields...')
+    window.field_filter.setClearButtonEnabled(True)
+    window.field_filter.setStyleSheet('padding:3px 6px;font-size:11px;')
+    window.field_filter.textChanged.connect(window.render_detail_fields)
+    field_header.addWidget(window.field_count)
+    field_header.addWidget(window.field_filter, 1)
+    detail_layout.addLayout(field_header)
+    detail_layout.addWidget(window.detail, 1)
     window.results_split.addWidget(window.detail_drawer)
     window.results_split.setStretchFactor(0, 1)
     window.results_split.setStretchFactor(1, 0)
@@ -624,13 +672,19 @@ def build(window):
     window.page_size = QComboBox(search_page)
     window.page_size.addItem('50 per page', 50)
     window.page_size.hide()
-    layout.addLayout(footer)
+    footer.setContentsMargins(12, 6, 12, 6)
+    for item in window.page_buttons:
+        item.setIcon(QIcon())
+    result_layout.addLayout(footer)
 
     def page(title):
         area = QScrollArea()
+        area.viewport().setObjectName('pageViewport')
         area.setWidgetResizable(True)
         area.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
+        content.setObjectName('pageContent')
+        content.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         box = QVBoxLayout(content)
         box.setContentsMargins(24, 24, 24, 24)
         heading = QLabel(title)

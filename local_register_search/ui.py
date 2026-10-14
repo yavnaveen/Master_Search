@@ -7,11 +7,11 @@ import sys
 import datetime
 from pathlib import Path
 from openpyxl.utils.cell import column_index_from_string, get_column_letter
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl, QSize
 from PySide6.QtGui import QDesktopServices, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QComboBox, QTableWidget, QTableWidgetItem, QTextBrowser,
-    QLabel, QListWidget, QFileDialog, QMessageBox, QSplitter, QProgressBar)
+    QLabel, QListWidget, QFileDialog, QMessageBox, QSplitter, QProgressBar, QMenu)
 from .database import connect, data_dir, needs_search_update
 from .indexer import sync, local_folder
 from .search import search
@@ -36,7 +36,7 @@ class Worker(QThread):
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Local Register Search')
+        self.setWindowTitle('Master Register Search - v2')
         self.resize(1250, 850)
         self.path = data_dir() / 'index.sqlite3'
         db = connect(self.path)
@@ -163,10 +163,16 @@ class Window(QMainWindow):
                 label.setProperty('lightStyle', original)
             if label is self.feedback:
                 continue
-            label.setStyleSheet(re.sub(r'color:#[0-9a-fA-F]{6}', 'color:#d8e5ed', original).replace('background:#e6f3f5', 'background:#294152') if self.dark_mode else original)
+            if self.dark_mode:
+                style = re.sub(r'(?<![\w-])color\s*:\s*#(?:52647b|35465c|64748b|142338)\b', 'color:#afc4d2', original, flags=re.IGNORECASE)
+                style = re.sub(r'(?<![\w-])color\s*:\s*#b42318\b', 'color:#ffb4ab', style, flags=re.IGNORECASE)
+                label.setStyleSheet(style)
+            else:
+                label.setStyleSheet(original)
         self.table.viewport().update()
         self.table.frozen.viewport().update()
         self.show_detail()
+        self.update_empty_state()
 
     def set_auto_sync(self, enabled):
         self.auto_sync = enabled
@@ -346,20 +352,41 @@ class Window(QMainWindow):
 
     def update_empty_state(self):
         first_run = getattr(self, 'indexed', 0) == 0
+        for label in (self.count, self.result_count, self.empty_message):
+            base = label.property('noDataBaseStyle')
+            if base is None:
+                base = label.property('lightStyle')
+                if base is None:
+                    base = label.styleSheet()
+                label.setProperty('noDataBaseStyle', base)
+            style = re.sub(r'(?<![\w-])color\s*:\s*#[0-9a-fA-F]{6}', 'color:#afc4d2', base) if self.dark_mode else base
+            if first_run and label is self.empty_message:
+                style += 'color:' + ('#ffb4ab' if self.dark_mode else '#b42318') + ';font-weight:600;'
+            label.setStyleSheet(style)
         empty = not getattr(self, 'total', 0)
         self.empty_card.setVisible(empty)
         self.table.setVisible(not empty)
-        self.empty_title.setText('Get started' if first_run else 'No matching records')
-        self.empty_message.setText('Step 1: Add folder\nStep 2: Sync files\nStep 3: Search\n\nDrop a local folder here to add it.' if first_run else 'Try another keyword, or choose All files and All worksheets.')
-        if not valid_query(self.query.text()):
+        self.empty_title.setText('No searchable data' if first_run else 'No matching records')
+        self.empty_message.setText(self.no_data_message() if first_run else 'Try another keyword, or choose All files and All worksheets.')
+        if first_run:
+            self.count.clear()
+            self.result_count.clear()
+        elif not valid_query(self.query.text()):
             self.empty_title.setText('Search your registers')
             self.empty_message.setText('Type a keyword and press Enter.')
-        if getattr(self, 'index_update_needed', False) and valid_query(self.query.text()):
+        if not first_run and getattr(self, 'index_update_needed', False) and valid_query(self.query.text()):
             self.empty_message.setText('Search index update ho raha hai. Sync files dobara dabayein')
         self.empty_sync.setVisible(first_run and bool(self.folders))
         self.empty_add.setVisible(first_run)
         self.empty_reset.setVisible(not first_run)
         self.empty_sync.setText('Sync now' + (f' · {Path(self.folders[0]).name}' if len(self.folders) == 1 else ''))
+
+    def no_data_message(self):
+        if self.scanning:
+            return 'Files are syncing. Search will be available after data is indexed.'
+        if self.folders:
+            return 'No searchable data is synced. Click Sync files to import Excel records before searching.'
+        return 'No searchable data is available. Please add a folder and sync files before searching.'
 
     def reset_filters(self):
         self.query.clear()
@@ -486,7 +513,7 @@ class Window(QMainWindow):
         stale = db.execute('SELECT count(*) FROM files WHERE stale=1').fetchone()[0]
         if stale:
             self.errors.setPlainText('\n'.join(f"{row['path']}: {row['error']}" for row in db.execute('SELECT path,error FROM files WHERE stale=1')))
-        self.setWindowTitle(f"Local Register Search • {stale} stale files" if stale else 'Local Register Search')
+        self.setWindowTitle(f"Master Register Search - v2 • {stale} stale files" if stale else 'Master Register Search - v2')
         indexed = db.execute('SELECT count(*) FROM files WHERE stale=0').fetchone()[0]
         self.indexed = db.execute('SELECT count(*) FROM rows').fetchone()[0]
         self.index_update_needed = needs_search_update(db)
@@ -535,6 +562,16 @@ class Window(QMainWindow):
 
     def run_search(self):
         self.export_button.setEnabled(False)
+        db = connect(self.path)
+        try:
+            self.indexed = db.execute('SELECT count(*) FROM rows').fetchone()[0]
+        finally:
+            db.close()
+        if not self.indexed:
+            self.generation += 1
+            self.search_pending = False
+            self.search_done(self.generation, (0, []))
+            return
         if not valid_query(self.query.text()):
             self.generation += 1
             self.search_done(self.generation, (0, []))
@@ -578,25 +615,33 @@ class Window(QMainWindow):
         self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
         self.table.clearContents()
-        self.table.setColumnCount(4 + len(columns))
+        self.table.setColumnCount(5 + len(columns))
         mixed_headers = any(row.get('mixed_headers') for row in self.rows) or len({json.dumps(headers, sort_keys=True) for headers in header_sets}) > 1
         labels = []
         for column in columns:
             names = list(dict.fromkeys(headers[column].strip() for headers in header_sets if headers.get(column, '').strip()))
             labels.append(names[0] if names and not mixed_headers else f'Column {column}')
-        self.table.setHorizontalHeaderLabels(['File', 'Sheet', 'Row'] + labels + ['Section'])
+        self.table.setHorizontalHeaderLabels(['File', 'Sheet', 'Row'] + labels + ['Section', 'Open'])
+        open_column = 4 + len(columns)
+        self.table.setColumnWidth(open_column, 48)
         self.table.setColumnWidth(3 + len(columns), self.column_widths.get('section', 240))
-        for j, (key, width) in enumerate(zip(('file', 'sheet', 'row'), (220, 140, 65))):
-            self.table.setColumnWidth(j, self.column_widths.get(key, width))
+        for j, (key, width) in enumerate(zip(('file', 'sheet', 'row'), (180, 110, 45))):
+            self.table.setColumnWidth(j, min(260, self.column_widths.get(key, width)) if j == 0 else width)
         for j, column in enumerate(columns, 3):
             self.table.horizontalHeaderItem(j).setToolTip(f'Excel column {column}: {labels[j - 3]}')
         for j in range(3, 3 + len(columns)):
             name = labels[j - 3].casefold()
             width = 310 if 'subject' in name or 'description' in name else 180 if 'letter' in name else 110 if 'date' in name else 70 if name in ('s. n.', 's.n.', 's no', 's. no.') else 130
+            if labels[j - 3].startswith('Column '):
+                values = [self.display_cell(record.get(columns[j - 3], '')) for record in cells]
+                metrics = self.table.fontMetrics()
+                width = min(240, max(70, metrics.horizontalAdvance(labels[j - 3]) + 16,
+                                     max((metrics.horizontalAdvance(value.replace('\n', ' ')) + 16 for value in values), default=0)))
             self.table.setColumnWidth(j, self.column_widths.get('cell:' + columns[j - 3] + ':' + labels[j - 3], width))
             self.table.setItemDelegateForColumn(j, self.match_delegate)
         self.table.setRowCount(len(self.rows))
         self.detail.clear()
+        from .layout import action_icon
         for i, row in enumerate(self.rows):
             values = [Path(row['path']).name + (' [STALE]' if row['stale'] else ''),
                       row['sheet'] + (' [hidden]' if row['hidden'] else ''), str(row['rownum'])]
@@ -612,6 +657,17 @@ class Window(QMainWindow):
                 item.setTextAlignment((Qt.AlignmentFlag.AlignRight if numeric else Qt.AlignmentFlag.AlignLeft) | Qt.AlignmentFlag.AlignVCenter)
                 item.setToolTip(row['path'] + '\nSheet: ' + row['sheet'] if j == 0 else value)
                 self.table.setItem(i, j, item)
+            open_button = QPushButton()
+            open_button.setIcon(action_icon('Open'))
+            open_button.setIconSize(QSize(14, 14))
+            open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            open_button.setAccessibleName('Open Excel file')
+            open_button.setToolTip(f"Open {Path(row['path']).name} — {row['sheet']}, row {row['rownum']}")
+            open_button.setStyleSheet('padding:0px 4px;')
+            open_button.clicked.connect(lambda checked=False, record=row: self.open_path(False, record))
+            self.table.setCellWidget(i, open_column, open_button)
+        for column in (1, 2):
+            self.table.resizeColumnToContents(column)
         self.table.resizeRowsToContents()
         self.rendering_results = False
         self.table.setUpdatesEnabled(True)
@@ -619,7 +675,7 @@ class Window(QMainWindow):
         self.table.update_frozen()
         size = self.page_size.currentData()
         start = self.page * size + 1 if size > 0 else 1
-        self.count.setText(f'Showing {start}-{start + len(self.rows) - 1} of {self.total} results' if self.total else ('Type a keyword and press Enter.' if not valid_query(self.query.text()) else 'No matching rows. Try another keyword or reset filters.'))
+        self.count.setText(f'Showing {start}-{start + len(self.rows) - 1} of {self.total} results' if self.total else (self.no_data_message() if not self.indexed else 'Type a keyword and press Enter.' if not valid_query(self.query.text()) else 'No matching rows. Try another keyword or reset filters.'))
         self.result_count.setText(self.count.text())
         if self.total:
             self.result_count.setText(self.count.text() + ' · Keywords: ' + ', '.join(value for value, color in self.active_keywords))
@@ -635,10 +691,18 @@ class Window(QMainWindow):
             self.show_detail()
         else:
             self.file_title.clear()
+            self.detail_file_paths = {}
+            self.detail_fields = []
+            self.record_meta.clear()
+            self.field_count.setText('0 fields')
+            self.open_file_button.hide()
             self.detail.setHtml('<h3>No results to display</h3><p>Try a different search or select All files and All worksheets.</p>')
 
     def table_column_resized(self, column, old, width):
         if self.rendering_results:
+            return
+        if column == 0 and width > 260:
+            self.table.setColumnWidth(0, 260)
             return
         if column < 3:
             key = ('file', 'sheet', 'row')[column]
@@ -667,7 +731,7 @@ class Window(QMainWindow):
             self.table.selectRow(index.row())
             self.show_detail()
             self.detail_drawer.show()
-            self.results_split.setSizes([max(280, self.results_split.width() - 360), 360])
+            self.results_split.setSizes([max(280, self.results_split.width() - 330), 330])
 
     def row_fields(self, row):
         cells = json.loads(row['cells'])
@@ -750,19 +814,106 @@ class Window(QMainWindow):
             filename = Path(row['path']).name
             self.file_title.setText(self.file_title.fontMetrics().elidedText(filename, Qt.TextElideMode.ElideMiddle, max(200, self.detail.width() - 20)))
             self.file_title.setToolTip(filename)
-            content = f"<p style='color:#52647b;margin:0 0 6px'>{html.escape(row['sheet'])} • Excel row {row['rownum']}" + (' • Hidden worksheet' if row['hidden'] else '') + (' • STALE: source could not be refreshed' if row['stale'] else '') + '</p>'
-            wrapped_path = html.escape(row['path']).replace('\\', '\\\u200b').replace('/', '/\u200b').replace('_', '_\u200b')
-            content += f"<p style='color:#64748b;font-size:12px;margin:0 0 8px'>{wrapped_path}</p>"
-            if row.get('row_section'):
-                content += '<p><b>Section:</b> ' + self.highlight(row['row_section']) + '</p>'
             fields = self.row_fields(row)
-            content += f'<p style="color:#52647b;margin:0 0 8px"><b>Complete row · {len(fields)} fields</b> · Scroll for all values</p>'
-            content += '<table width="100%" cellspacing="0" cellpadding="9">'
-            content += ''.join(f'<tr bgcolor="{"#f4f7fc" if i % 2 == 0 else "#ffffff"}"><td><b>{html.escape(label)}:</b> {self.highlight(self.display_cell(value)).replace(chr(10), "<br>") if value else "<span style=color:#64748b>(empty)</span>"}<br><small>{html.escape(column)}{row["rownum"]}</small></td></tr>' for i, (column, label, value) in enumerate(fields)) + '</table>'
-            if self.dark_mode:
-                content = content.replace('#f4f7fc', '#223747').replace('#ffffff', '#1b2d3d').replace('#52647b', '#afc4d2').replace('#64748b', '#afc4d2')
-            self.detail.setHtml(content)
+            identity = (row['path'], row['sheet'], row['rownum'])
+            if identity != getattr(self, 'detail_identity', None):
+                self.expanded_notes = set()
+                self.field_filter.blockSignals(True)
+                self.field_filter.clear()
+                self.field_filter.blockSignals(False)
+            self.detail_identity = identity
+            self.detail_fields = fields
+            self.detail_section = row.get('row_section') or ''
+            metadata = row['sheet'] + f" • Excel row {row['rownum']}"
+            metadata += ' • Hidden worksheet' if row['hidden'] else ''
+            metadata += ' • STALE' if row['stale'] else ''
+            short_path = self.record_meta.fontMetrics().elidedText(row['path'], Qt.TextElideMode.ElideRight, max(220, self.detail_drawer.width() - 24))
+            self.record_meta.setText(metadata + '\n' + short_path)
+            self.record_meta.setToolTip(row['path'])
+            from .desktop_features import referenced_file
+            self.detail_file_paths = {column: path for column, label, value in fields
+                                      if (path := referenced_file(value, row['path'])) is not None}
+            old_menu = self.open_file_button.menu()
+            self.open_file_button.setMenu(None)
+            if old_menu:
+                old_menu.deleteLater()
+            if len(self.detail_file_paths) > 1:
+                menu = QMenu(self.open_file_button)
+                for column, path in self.detail_file_paths.items():
+                    action = menu.addAction(f'{column}: {path.name}')
+                    action.triggered.connect(lambda checked=False, key=column: self.open_referenced_file(QUrl('record-file:' + key)))
+                self.open_file_button.setMenu(menu)
+            self.open_file_button.setVisible(bool(self.detail_file_paths))
+            self.open_file_button.setToolTip('\n'.join(str(path) for path in self.detail_file_paths.values()))
+            self.render_detail_fields()
             self.detail.verticalScrollBar().setValue(0)
+
+    def render_detail_fields(self, *_):
+        fields = getattr(self, 'detail_fields', [])
+        query = self.field_filter.text().strip().casefold()
+        shown_fields = [(column, label, value) for column, label, value in fields
+                        if not query or query in (column + ' ' + label + ' ' + value).casefold()]
+        shown_fields.sort(key=lambda field: 'note' not in field[1].casefold())
+        self.field_count.setText(f'{len(shown_fields)} of {len(fields)} fields' if query else f'{len(fields)} fields')
+        muted = '#afc4d2' if self.dark_mode else '#52647b'
+        content = ''
+        if getattr(self, 'detail_section', ''):
+            content += '<p style="margin:0 0 6px"><b>Section:</b> ' + self.highlight(self.detail_section) + '</p>'
+        content += '<table width="100%" cellspacing="0" cellpadding="5">'
+        for i, (column, label, value) in enumerate(shown_fields):
+            background = ('#223747' if i % 2 == 0 else '#1b2d3d') if self.dark_mode else ('#f2f6f8' if i % 2 == 0 else '#ffffff')
+            descriptive_header = len(label) > 60 or '\n' in label or (label.strip().casefold().startswith('note:') and len(label) > 25)
+            field_label = f'Column {column}' if descriptive_header else label
+            if descriptive_header:
+                key = column + ':header'
+                expanded_header = key in getattr(self, 'expanded_notes', set())
+                header_text = label if expanded_header or len(label) <= 140 else label[:140] + '…'
+                heading = 'Note' if label.strip().casefold().startswith('note') else f'Header — Column {column}'
+                content += f'<tr bgcolor="{background}"><td colspan="2" valign="top"><b>{heading}</b><br>{self.highlight(header_text).replace(chr(10), "<br>")}'
+                if len(label) > 140:
+                    content += f'<br><a href="expand-note:{key}" style="color:#126175;text-decoration:none;">{"Show less" if expanded_header else "Show more"}</a>'
+                content += '</td></tr>'
+            display = self.display_cell(value)
+            note = 'note' in label.casefold() and not descriptive_header
+            expanded = column in getattr(self, 'expanded_notes', set())
+            shortened = note and len(display) > 100 and not expanded
+            text = display[:100] + '…' if shortened else display
+            shown = self.highlight(text).replace(chr(10), '<br>') if value else '-'
+            if note and len(display) > 100:
+                shown += f'<br><a href="expand-note:{column}" style="color:#126175;text-decoration:none;">{"Show less" if expanded else "Show more"}</a>'
+            content += f'<tr bgcolor="{background}"><td width="30%" valign="top" style="color:{muted};font-size:11px;">{html.escape(field_label)}</td><td width="70%" valign="top">{shown}</td></tr>'
+        content += '</table>'
+        if query and not shown_fields:
+            content += f'<p style="color:{muted}">No matching fields.</p>'
+        self.detail.setHtml(content)
+
+    def detail_link_clicked(self, url):
+        if url.scheme() != 'expand-note':
+            return
+        column = url.path()
+        if column in self.expanded_notes:
+            self.expanded_notes.remove(column)
+        else:
+            self.expanded_notes.add(column)
+        self.render_detail_fields()
+
+    def open_referenced_file(self, url=None):
+        if url is None:
+            paths = getattr(self, 'detail_file_paths', {})
+            if len(paths) != 1:
+                return
+            url = QUrl('record-file:' + next(iter(paths)))
+        if url.scheme() != 'record-file':
+            return
+        path = getattr(self, 'detail_file_paths', {}).get(url.path())
+        if path is None:
+            return
+        if not path.is_file():
+            self.notify('File is unavailable: ' + str(path), True)
+            QMessageBox.warning(self, 'Unavailable', 'The referenced file is unavailable:\n' + str(path))
+            return
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        self.notify('Opening file…' if opened else 'Could not open the file. Check the default application.', not opened)
 
     def copy_row(self):
         row = self.selected()
@@ -773,15 +924,16 @@ class Window(QMainWindow):
         else:
             self.notify('Select a record first.', True)
 
-    def open_path(self, folder):
-        row = self.selected()
+    def open_path(self, folder, row=None):
+        row = row if row is not None else self.selected()
         if row:
             path = Path(row['path']).parent if folder else Path(row['path'])
             if not path.exists():
                 self.notify('Original path is unavailable. Sync to refresh the index.', True)
                 QMessageBox.warning(self, 'Unavailable', 'The original path is unavailable. Sync to refresh the index.')
             else:
-                opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+                from .desktop_features import open_excel_record
+                opened = (not folder and open_excel_record(path, row['sheet'], row['rownum'])) or QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
                 self.notify(('Opening folder…' if folder else 'Opening Excel file…') if opened else 'Could not open the path. Check the default application.', not opened)
         else:
             self.notify('Select a record first.', True)

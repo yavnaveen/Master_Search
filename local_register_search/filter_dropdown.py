@@ -2,7 +2,27 @@
 import re
 from PySide6.QtCore import Qt, QEvent, QSize
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QComboBox, QFrame, QVBoxLayout, QLineEdit, QListWidget, QListWidgetItem
+from PySide6.QtWidgets import QComboBox, QFrame, QVBoxLayout, QLineEdit, QListWidget, QListWidgetItem, QSizePolicy, QStyle, QStyleOptionComboBox
+
+
+class ContentCombo(QComboBox):
+    """Size the closed control to its selected text; keep popup sizing separate."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.currentTextChanged.connect(self.updateGeometry)
+
+    def sizeHint(self):
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        text_size = self.fontMetrics().size(Qt.TextFlag.TextSingleLine, self.currentText())
+        if not self.itemIcon(self.currentIndex()).isNull():
+            text_size.setWidth(text_size.width() + self.iconSize().width() + 4)
+            text_size.setHeight(max(text_size.height(), self.iconSize().height()))
+        return self.style().sizeFromContents(QStyle.ContentsType.CT_ComboBox, option, text_size, self)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
 
 
 def natural_key(value):
@@ -10,7 +30,7 @@ def natural_key(value):
                  for part in re.split(r'(\d+)', str(value)))
 
 
-class SearchableCombo(QComboBox):
+class SearchableCombo(ContentCombo):
     MAX_VISIBLE_ITEMS = 12
 
     def __init__(self, empty_message, parent=None):

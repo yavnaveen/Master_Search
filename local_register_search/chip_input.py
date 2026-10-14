@@ -25,17 +25,18 @@ class ChipInput(QWidget):
         self.chips = []
         self.editing = None
         self.flow = WrapLayout(self)
-        self.flow.setContentsMargins(8, 6, 8, 6)
+        self.flow.setContentsMargins(6, 3, 6, 3)
+        self.flow.setSpacing(6)
         self.editor = QLineEdit()
         self.editor.setMinimumWidth(220)
-        self.editor.setStyleSheet('font-size:18px;border:none;background:transparent;padding:6px;')
+        self.editor.setStyleSheet('font-size:12px;border:none;background:transparent;padding:3px;')
         self.editor.installEventFilter(self)
         self.editor.textChanged.connect(lambda: self.textChanged.emit(self.text()))
         self.editor.returnPressed.connect(self.enter)
         self.clear_button = QPushButton('×')
         self.clear_button.setAccessibleName('Clear all keywords')
         self.clear_button.setToolTip('Clear all')
-        self.clear_button.setFixedSize(32, 32)
+        self.clear_button.setFixedSize(22, 22)
         self.clear_button.setStyleSheet('padding:0;border:none;background:transparent;')
         self.clear_button.clicked.connect(self.clear)
         self.rebuild()
@@ -55,7 +56,7 @@ class ChipInput(QWidget):
     def set_theme(self, dark):
         background, foreground = ('#22394a', '#e5eff5') if dark else ('white', '#142338')
         self.setStyleSheet(f'QWidget#chipInput {{background:{background};border:1px solid #c7d2dd;border-radius:6px;}}')
-        self.editor.setStyleSheet(f'font-size:18px;border:none;background:transparent;color:{foreground};padding:6px;')
+        self.editor.setStyleSheet(f'font-size:12px;border:none;background:transparent;color:{foreground};padding:3px;')
 
     def text(self):
         if not self.chips and not self.editing and len(self.editor.text().strip()) < 2:
@@ -163,7 +164,7 @@ class ChipInput(QWidget):
             row.setContentsMargins(8, 2, 4, 2)
             label = QLabel(value)
             label.setMaximumWidth(300)
-            label.setWordWrap(True)
+            label.setWordWrap(False)
             label.setToolTip(value + '\nDouble-click to edit')
             label.setProperty('chipIndex', index)
             label.installEventFilter(self)
@@ -171,7 +172,7 @@ class ChipInput(QWidget):
             chip.installEventFilter(self)
             row.addWidget(label)
             close = QPushButton('×')
-            close.setFixedSize(26, 26)
+            close.setFixedSize(18, 18)
             close.setStyleSheet('padding:0;border:none;background:transparent;color:#142338;')
             close.setAccessibleName('Remove keyword ' + value)
             close.clicked.connect(lambda checked=False, i=index: self.remove_chip(i))

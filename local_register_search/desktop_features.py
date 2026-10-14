@@ -2,10 +2,49 @@
 import csv
 import json
 import os
+import re
 import tempfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from openpyxl import Workbook
 from .indexer import local_folder
+
+
+def referenced_file(value, workbook_path):
+    """Recognize a cell containing a local file path, including unavailable files."""
+    text = str(value or '').strip().strip('"')
+    if not text or '\n' in text or '\r' in text or '://' in text:
+        return None
+    windows_path = PureWindowsPath(text)
+    if not windows_path.suffix or not re.fullmatch(r'\.[A-Za-z0-9]{1,10}', windows_path.suffix):
+        return None
+    if not ('\\' in text or '/' in text or windows_path.suffix.lower() in
+            {'.pdf', '.xlsx', '.xlsm', '.xls', '.doc', '.docx', '.txt', '.csv', '.png', '.jpg', '.jpeg'}):
+        return None
+    path = Path(text)
+    return path if path.is_absolute() else Path(workbook_path).parent / path
+
+
+def open_excel_record(path, sheet, rownum):
+    """Jump using Excel automation when available; caller handles default-app fallback."""
+    if os.name != 'nt':
+        return False
+    try:
+        import win32com.client
+        excel = win32com.client.Dispatch('Excel.Application')
+        workbook = next((book for book in excel.Workbooks
+                         if os.path.normcase(book.FullName) == os.path.normcase(str(path.resolve()))), None)
+        if workbook is None:
+            workbook = excel.Workbooks.Open(str(path.resolve()))
+        excel.Visible = True
+        try:
+            worksheet = workbook.Worksheets(sheet)
+            worksheet.Activate()
+            excel.Goto(worksheet.Cells(int(rownum), 1), True)
+        except Exception:
+            pass  # Hidden sheets may not activate; the workbook is still open.
+        return True
+    except Exception:
+        return False
 
 
 def folder_snapshot(folders, cancel):
