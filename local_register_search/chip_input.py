@@ -3,7 +3,7 @@ import json
 from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLineEdit, QPushButton, QLabel
 
-COLORS = ('#FFE08A', '#CDEBE7', '#DDE3FF', '#F8D8E6', '#DCEBC5', '#FFE0C2', '#D5EAFB', '#E9D9F5')
+COLORS = ('#ffeb3b', '#fff176', '#ffee58', '#ffe082', '#ffd54f', '#ffecb3', '#fff59d', '#fff9c4')
 
 
 def is_keyword(value):

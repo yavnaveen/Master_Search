@@ -66,7 +66,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(search(self.db_path, 'other', sheet='Other')[0], 1)
 
     def test_pagination_export_and_sync(self):
-        pages = [search(self.db_path, 'bulk', page=i) for i in range(3)]
+        pages = [search(self.db_path, 'bulk', page=i, page_size=50) for i in range(3)]
         self.assertEqual([len(rows) for total, rows in pages], [50, 50, 5])
         self.assertTrue(all(total == 105 for total, rows in pages))
         ids = [row['id'] for _, rows in pages for row in rows]
@@ -178,14 +178,16 @@ class SearchTests(unittest.TestCase):
         window.query.setText('bulk')
         window.submit_search()
         settle()
-        self.assertEqual(window.table.rowCount(), 50)
-        self.assertTrue(window.result_count.text().startswith('Showing 1-50 of 105 results'))
+        self.assertEqual(window.table.rowCount(), 10)
+        self.assertEqual(window.result_count.text(), '105 matches in 1 file')
+        # With all-rows fetch (no global page limit), page navigation has no effect;
+        # the first group card always shows the first BATCH_SIZE=10 rows.
         window.change_page(1)
         settle()
-        self.assertTrue(window.result_count.text().startswith('Showing 51-100 of 105 results'))
+        self.assertEqual(window.result_count.text(), '105 matches in 1 file')
         window.change_page(1)
         settle()
-        self.assertEqual(window.table.rowCount(), 5)
+        self.assertEqual(window.table.rowCount(), 10)
         self.assertFalse(window.page_buttons[1].isEnabled())
         window.query.setText('a')
         self.assertEqual(window.table.rowCount(), 0)
@@ -320,12 +322,11 @@ class SearchTests(unittest.TestCase):
             window = Window()
         self.addCleanup(window.close)
         window.search_done(window.generation, (3, mixed))
-        self.assertEqual(window.table.horizontalHeaderItem(3).text(), 'Column A')
-        self.assertEqual(window.table.horizontalHeaderItem(window.table.columnCount() - 2).text(), 'Section')
-        self.assertEqual(window.table.horizontalHeaderItem(window.table.columnCount() - 1).text(), 'Open')
+        self.assertEqual(window.table.horizontalHeaderItem(1).text(), 'Field')
+        self.assertEqual(window.table.horizontalHeaderItem(window.table.columnCount() - 1).text(), 'Section')
         client_index = next(i for i, row in enumerate(mixed) if row['row_section'] == 'B - Client Data')
         self.assertEqual(window.row_fields(mixed[client_index])[0][1], 'Field')
-        window.select_record(window.table.model().index(client_index, 0))
+        window.select_record_data(mixed[client_index])
         self.assertIn('Section:', window.detail.toPlainText())
         self.assertIn('B - Client Data', window.detail.toPlainText())
         option = next(control for control in window.findChildren(QCheckBox) if control.text() == 'Include section heading in search')
@@ -370,8 +371,8 @@ class SearchTests(unittest.TestCase):
         self.assertIn(bar.chips[0][1], window.highlight(phrases[0]))
         self.assertIn(bar.chips[1][1], window.highlight(phrases[1]))
         self.assertEqual(window.highlight('-'), '-')
-        self.assertEqual(window.table.item(0, 5).data(Qt.ItemDataRole.UserRole), 'empty-cell')
-        self.assertIn(phrases[0], window.result_count.text())
+        self.assertEqual(window.table.item(0, 3).data(Qt.ItemDataRole.UserRole), 'empty-cell')
+        self.assertEqual(window.result_count.text(), '1 match in 1 file')
         bar.edit_chip(0)
         bar.editor.setText('Administration - Bank Guarantees updated')
         bar.enter()
@@ -481,23 +482,20 @@ class SearchTests(unittest.TestCase):
         row['path'] = str(self.root / 'PMS draft KPI Sheet with a very long file name.xlsx')
         window.search_done(window.generation, (1, [row]))
         app.processEvents()
-        self.assertEqual(window.table.horizontalHeaderItem(3).text(), 'KPI')
-        self.assertEqual(window.table.horizontalHeaderItem(5).text(), 'Column C')
+        self.assertEqual(window.table.horizontalHeaderItem(1).text(), 'KPI')
+        self.assertEqual(window.table.horizontalHeaderItem(3).text(), 'Col C')
+        self.assertEqual(window.table.item(0, 3).text(), '-')
         self.assertEqual(window.table.item(0, 5).text(), '-')
-        self.assertEqual(window.table.item(0, 7).text(), '-')
-        self.assertTrue(window.table.item(0, 4).textAlignment() & Qt.AlignmentFlag.AlignRight)
-        self.assertTrue(window.table.item(0, 3).textAlignment() & Qt.AlignmentFlag.AlignLeft)
+        self.assertTrue(window.table.item(0, 2).textAlignment() & Qt.AlignmentFlag.AlignRight)
+        self.assertTrue(window.table.item(0, 1).textAlignment() & Qt.AlignmentFlag.AlignLeft)
         font = window.table.font()
-        lines = window.match_delegate.visible_lines(long_text, font, 110, 3)
+        lines = window.match_delegate.visible_lines(long_text, font, 110, 1)
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[-1].endswith('…'))
         self.assertGreaterEqual(window.table.rowHeight(0), 18)
         self.assertLessEqual(window.table.rowHeight(0), 22)
-        self.assertEqual(window.table.rowHeight(0), window.table.frozen.rowHeight(0))
-        self.assertEqual(window.table.item(0, 3).toolTip(), long_text)
-        window.table.setColumnWidth(0, 400)
-        self.assertLessEqual(window.table.columnWidth(0), 260)
-        open_button = window.table.cellWidget(0, window.table.columnCount() - 1)
+        self.assertEqual(window.table.item(0, 1).toolTip(), long_text)
+        open_button = window.group_cards[0].open_file_btn
         with patch.object(window, 'open_path') as open_path:
             open_button.click()
             open_path.assert_called_once_with(False, row)
@@ -507,22 +505,8 @@ class SearchTests(unittest.TestCase):
             window.open_path(False, existing_row)
             jump.assert_called_once_with(Path(existing_row['path']), existing_row['sheet'], existing_row['rownum'])
             fallback.assert_called_once()
-        filename = Path(row['path']).name
-        elided = window.match_delegate.visible_lines(filename, font, 120, 0)[0]
-        self.assertNotEqual(elided, filename)
-        self.assertTrue(elided.endswith('.xlsx'))
-        window.select_record(window.table.model().index(0, 0))
+        window.select_record_data(row)
         self.assertIn(long_text, window.detail.toPlainText())
-        window.table.setColumnWidth(3, 330)
-        window.column_resize_timer.stop()
-        window.finish_column_resize()
-        window.search_done(window.generation, (1, [row]))
-        self.assertEqual(window.table.columnWidth(3), 330)
-        with patch('local_register_search.ui.data_dir', return_value=self.root):
-            reopened = Window()
-        self.addCleanup(reopened.close)
-        reopened.search_done(reopened.generation, (1, [row]))
-        self.assertEqual(reopened.table.columnWidth(3), 330)
 
     def test_dark_theme_page_backgrounds_and_button_colors(self):
         from PySide6.QtWidgets import QApplication, QLabel
@@ -612,6 +596,354 @@ class SearchTests(unittest.TestCase):
         app.processEvents()
         if os.environ.get('SEARCH_UI_PREVIEW'):
             window.grab().save(os.environ['SEARCH_UI_PREVIEW'])
+
+    def test_ktlr_layout_header_detection_and_folder_scoping(self):
+        from openpyxl.styles import Alignment
+        ktlr_dir = self.root / 'KTLR'
+        ktlr_dir.mkdir()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Outgoing'
+        ws.merge_cells('A1:I1')
+        ws['A1'] = 'Project Name : Kharghar Turbhe Tunnel Road (KTLR)'
+        headers = ['Sr No', 'Date', 'Letter Number', 'Type', 'Communication Mode', 'From', 'To', 'Subject', 'Attachments']
+        for col_idx, name in enumerate(headers, 1):
+            ws.cell(row=3, column=col_idx, value=name)
+        # Column J has no header name in row 3
+        row4 = [1, '15-10-2026', 'KTLR/2026/001', 'Letter', 'Email', 'Lombardi', 'Client', 'Monthly Report\nSubmission', 'Report.pdf', 12]
+        for col_idx, val in enumerate(row4, 1):
+            cell = ws.cell(row=4, column=col_idx, value=val)
+            if '\n' in str(val):
+                cell.alignment = Alignment(wrap_text=True)
+        row5 = [2, '16-10-2026', 'KTLR/2026/002', 'Letter', 'Courier', 'Contractor', 'Lombardi', 'Invoice Verification', 'Invoice.pdf', 5]
+        for col_idx, val in enumerate(row5, 1):
+            ws.cell(row=5, column=col_idx, value=val)
+        ktlr_file = ktlr_dir / 'KTLR_Project.xlsx'
+        wb.save(ktlr_file)
+        wb.close()
+
+        ircon_dir = self.root / 'IRCON'
+        ircon_dir.mkdir()
+        wb_ircon = Workbook()
+        ws_ircon = wb_ircon.active
+        ws_ircon.title = 'Outgoing'
+        ws_ircon.append(['Sr No', 'Date', 'Letter No', 'Sender', 'Recipient', 'Subject'])
+        ws_ircon.append([1, '01-09-2026', 'IRCON/OUT/101', 'Lombardi', 'IRCON', 'Tunnel Design Submission'])
+        ircon_file = ircon_dir / 'Correspondence register_Project.xlsm'
+        wb_ircon.save(ircon_file)
+        wb_ircon.close()
+
+        db_path = self.root / 'ktlr_test.sqlite3'
+        result = sync(db_path, [str(ktlr_dir), str(ircon_dir)], threading.Event())
+        self.assertEqual(result['indexed'], 2, result)
+        self.assertEqual(result['errors'], [])
+
+        # 1. Header auto-detection: row 3 is detected as the header, row 1 merged title is ignored
+        db = connect(db_path)
+        hdr_row = db.execute("SELECT headers FROM sheet_headers WHERE path=?", (str(ktlr_file.resolve()),)).fetchone()
+        self.assertIsNotNone(hdr_row)
+        ktlr_headers = json.loads(hdr_row[0])
+        self.assertEqual(ktlr_headers['A'], 'Sr No')
+        self.assertEqual(ktlr_headers['B'], 'Date')
+        self.assertEqual(ktlr_headers['C'], 'Letter Number')
+        self.assertEqual(ktlr_headers['H'], 'Subject')
+        self.assertNotIn('Project Name', ktlr_headers.get('A', ''))
+
+        # Row 3 itself is NOT inserted as a data row
+        row3_in_data = db.execute("SELECT 1 FROM rows WHERE path=? AND rownum=3", (str(ktlr_file.resolve()),)).fetchone()
+        self.assertIsNone(row3_in_data)
+        db.close()
+
+        # 2. Folder-scoped search: searching KTLR only returns KTLR records
+        total_ktlr, rows_ktlr = search(db_path, 'Lombardi', folder=str(ktlr_dir))
+        self.assertEqual(total_ktlr, 2)
+        for r in rows_ktlr:
+            self.assertEqual(r['path'], str(ktlr_file.resolve()))
+            self.assertFalse(r['mixed_headers'])
+            headers_dict = json.loads(r['headers'])
+            self.assertEqual(headers_dict['A'], 'Sr No')
+            self.assertEqual(headers_dict['C'], 'Letter Number')
+
+        # Searching IRCON only returns IRCON records
+        total_ircon, rows_ircon = search(db_path, 'Lombardi', folder=str(ircon_dir))
+        self.assertEqual(total_ircon, 1)
+        self.assertEqual(rows_ircon[0]['path'], str(ircon_file.resolve()))
+
+        # Searching with folders=[ktlr_dir] excludes IRCON
+        total_folders, rows_folders = search(db_path, 'Lombardi', folders=[str(ktlr_dir)])
+        self.assertEqual(total_folders, 2)
+        self.assertTrue(all(r['path'] == str(ktlr_file.resolve()) for r in rows_folders))
+
+        # 3. Date, multi-line, and header exclusion
+        self.assertEqual(search(db_path, '15-10-2026', folder=str(ktlr_dir))[0], 1)
+        self.assertEqual(search(db_path, '15/10/2026', folder=str(ktlr_dir))[0], 1)
+        self.assertEqual(search(db_path, '"Monthly Report"', folder=str(ktlr_dir))[0], 1)
+        # Header string alone does not match data rows
+        self.assertEqual(search(db_path, '"Communication Mode"', folder=str(ktlr_dir))[0], 0)
+
+    def test_ktlr_style_workbook_sync_pipeline(self):
+        from openpyxl.styles import Alignment
+        ktlr_folder = self.root / 'KTLR_Pipeline_Test'
+        ktlr_folder.mkdir()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Email Register'
+        # Row 1: Merged title cell in A1:J1
+        ws.merge_cells('A1:J1')
+        ws['A1'] = 'Project Name : Kharghar Turbhe Tunnel Road (KTLR)'
+        # Row 2: Blank
+        # Row 3: Headers (Sr No to Attachments, Column J blank)
+        headers = ['Sr No', 'Date', 'Letter Number', 'Type', 'Communication Mode', 'From', 'To', 'Subject', 'Attachments']
+        for col_idx, name in enumerate(headers, 1):
+            ws.cell(row=3, column=col_idx, value=name)
+        # Row 4+: Data with wrapped text and DD-MM-YYYY dates
+        row4 = [1, '15-10-2026', 'KTLR/2026/001', 'Letter', 'Email', 'Lombardi', 'Client', 'Monthly Progress Report\nSubmission', 'Report.pdf', 12]
+        for col_idx, val in enumerate(row4, 1):
+            c = ws.cell(row=4, column=col_idx, value=val)
+            if '\n' in str(val):
+                c.alignment = Alignment(wrap_text=True)
+        row5 = [2, '20-10-2026', 'KTLR/2026/002', 'Notice', 'Speed Post', 'Authority', 'Lombardi', 'Site Inspection Notes\nSection B', 'Notice.pdf', 3]
+        for col_idx, val in enumerate(row5, 1):
+            c = ws.cell(row=5, column=col_idx, value=val)
+            if '\n' in str(val):
+                c.alignment = Alignment(wrap_text=True)
+        xlsx_file = ktlr_folder / 'KTLR_Project.xlsx'
+        wb.save(xlsx_file)
+        wb.close()
+
+        # Run full sync pipeline against temp folder
+        db_path = self.root / 'ktlr_pipeline.sqlite3'
+        result = sync(db_path, [str(ktlr_folder)], cancel=threading.Event(), rebuild=True)
+
+        # Assert files_indexed == 1 and rows_indexed > 0
+        files_indexed = result.get('files_indexed', result.get('indexed'))
+        rows_indexed = result.get('rows_indexed', 0)
+        self.assertEqual(files_indexed, 1)
+        self.assertGreater(rows_indexed, 0)
+        self.assertEqual(rows_indexed, 2)
+        self.assertEqual(len(result['errors']), 0)
+
+    def test_grouped_search_results_and_multi_sheet_export(self):
+        from local_register_search.search import group_search_results
+        from local_register_search.desktop_features import export_records
+        from openpyxl import load_workbook
+
+        test_dir = self.root / 'grouping_test_dir'
+        test_dir.mkdir()
+
+        # File 1: Invoices
+        wb1 = Workbook()
+        ws1 = wb1.active
+        ws1.title = 'Invoices'
+        ws1.append(['Invoice No', 'Vendor', 'Amount', 'Description'])
+        ws1.append(['INV-101', 'Lombardi India', 45000, 'Tunnel Design Consulting'])
+        wb1.save(test_dir / 'finance_register.xlsx')
+        wb1.close()
+
+        # File 2: Letters
+        wb2 = Workbook()
+        ws2 = wb2.active
+        ws2.title = 'Letters'
+        ws2.append(['Sr No', 'Letter Number', 'Sender', 'Recipient', 'Subject'])
+        ws2.append([1, 'LTR-001', 'Client', 'Lombardi', 'Site Notice'])
+        ws2.append([2, 'LTR-002', 'Lombardi', 'Contractor', 'Design Review'])
+        wb2.save(test_dir / 'correspondence_letters.xlsx')
+        wb2.close()
+
+        # File 3: Personnel
+        wb3 = Workbook()
+        ws3 = wb3.active
+        ws3.title = 'Personnel'
+        ws3.append(['Emp ID', 'Full Name', 'Designation', 'Project'])
+        ws3.append(['E-100', 'Lombardi Resident Engineer', 'Lead', 'KTLR'])
+        wb3.save(test_dir / 'hr_master.xlsx')
+        wb3.close()
+
+        db_path = self.root / 'group_test.sqlite3'
+        sync_result = sync(db_path, [str(test_dir)], threading.Event(), rebuild=True)
+        self.assertEqual(sync_result['indexed'], 3)
+
+        # 1. Search for 'Lombardi'
+        total, rows = search(db_path, 'Lombardi')
+        self.assertEqual(total, 4)
+
+        # 2. Check row dictionary attributes (Requirement 1)
+        for r in rows:
+            self.assertIn('file_id', r)
+            self.assertIn('file_name', r)
+            self.assertIn('file_path', r)
+            self.assertIn('folder', r)
+            self.assertIn('worksheet', r)
+            self.assertIn('excel_row', r)
+            self.assertIn('header_list', r)
+            self.assertIn('cells_dict', r)
+            self.assertEqual(r['file_name'], Path(r['path']).name)
+            self.assertEqual(r['worksheet'], r['sheet'])
+            self.assertEqual(r['excel_row'], r['rownum'])
+
+        # 3. Test grouping logic (Requirement 2 & 9)
+        # Default sort: most matches first
+        groups = group_search_results(rows, sort_order='matches')
+        self.assertEqual(len(groups), 3)
+
+        # Most matches first: Letters has 2 matches, Invoices and Personnel have 1 match each
+        self.assertEqual(groups[0]['file_name'], 'correspondence_letters.xlsx')
+        self.assertEqual(groups[0]['sheet'], 'Letters')
+        self.assertEqual(groups[0]['match_count'], 2)
+        self.assertEqual(groups[0]['labels'], ['Sr No', 'Letter Number', 'Sender', 'Recipient', 'Subject'])
+
+        # Group 1 & 2
+        names_and_sheets = {(g['file_name'], g['sheet']) for g in groups[1:]}
+        self.assertEqual(names_and_sheets, {('finance_register.xlsx', 'Invoices'), ('hr_master.xlsx', 'Personnel')})
+
+        inv_group = next(g for g in groups if g['file_name'] == 'finance_register.xlsx')
+        self.assertEqual(inv_group['match_count'], 1)
+        self.assertEqual(inv_group['labels'], ['Invoice No', 'Vendor', 'Amount', 'Description'])
+
+        hr_group = next(g for g in groups if g['file_name'] == 'hr_master.xlsx')
+        self.assertEqual(hr_group['match_count'], 1)
+        self.assertEqual(hr_group['labels'], ['Emp ID', 'Full Name', 'Designation', 'Project'])
+
+        # Test alphabetical sort
+        alpha_groups = group_search_results(rows, sort_order='alphabetical')
+        self.assertEqual([g['file_name'] for g in alpha_groups],
+                         ['correspondence_letters.xlsx', 'finance_register.xlsx', 'hr_master.xlsx'])
+
+        # 4. Test grouped multi-sheet Excel export (Requirement 7)
+        export_file = self.root / 'grouped_results.xlsx'
+        exported_count = export_records(export_file, rows)
+        self.assertEqual(exported_count, 4)
+
+        wb_exported = load_workbook(export_file)
+        self.assertEqual(len(wb_exported.sheetnames), 3)
+        for sname in wb_exported.sheetnames:
+            self.assertLessEqual(len(sname), 31)
+
+        # Verify Letters sheet in export
+        letters_sheet = next(wb_exported[s] for s in wb_exported.sheetnames if 'Letters' in s)
+        self.assertEqual(letters_sheet.cell(1, 1).value, 'Excel Row')
+        self.assertEqual(letters_sheet.cell(1, 2).value, 'Sr No')
+        self.assertEqual(letters_sheet.cell(1, 3).value, 'Letter Number')
+        self.assertEqual(letters_sheet.max_row, 3)  # header + 2 data rows
+
+        # Verify Invoices sheet in export
+        invoices_sheet = next(wb_exported[s] for s in wb_exported.sheetnames if 'Invoices' in s)
+        self.assertEqual(invoices_sheet.cell(1, 1).value, 'Excel Row')
+        self.assertEqual(invoices_sheet.cell(1, 2).value, 'Invoice No')
+        self.assertEqual(invoices_sheet.cell(1, 3).value, 'Vendor')
+        self.assertEqual(invoices_sheet.max_row, 2)  # header + 1 data row
+
+        wb_exported.close()
+
+    def test_ktlr_search_yes_excludes_lookup_sheet(self):
+        """Requirement 7: searching 'yes' on KTLR workbook returns 20 matches in ONE group (Email Register) and none from Dropdown_Master."""
+        from local_register_search.search import group_search_results
+        ktlr_dir = self.root / 'KTLR_Test'
+        ktlr_dir.mkdir(parents=True, exist_ok=True)
+        wb = Workbook()
+        ws_email = wb.active
+        ws_email.title = 'Email Register'
+        # Row 1 merged title
+        ws_email.merge_cells('A1:J1')
+        ws_email.cell(1, 1, 'Project Name : Kharghar Turbhe Tunnel Road (KTLR)')
+        # Row 2 blank
+        # Row 3 real header
+        headers = ['Sr No', 'Date', 'Letter Number', 'Type', 'Communication Mode', 'From', 'To', 'Subject', 'Attachments', '']
+        for col_idx, h in enumerate(headers, 1):
+            ws_email.cell(3, col_idx, h)
+        # Data rows: 41 data rows, exactly 20 with 'yes'
+        for row_num in range(1, 42):
+            has_yes = 'yes' if row_num <= 20 else 'no'
+            row_data = [row_num, f'{row_num:02d}-05-2024', f'LTR-{row_num:03d}', has_yes, 'Email', 'Client', 'Lombardi', f'Subject {row_num}', 'Doc.pdf', f'Page {row_num}']
+            for col_idx, val in enumerate(row_data, 1):
+                ws_email.cell(3 + row_num, col_idx, val)
+
+        # Dropdown_Master sheet (lookup sheet) containing 'yes'
+        ws_dropdown = wb.create_sheet('Dropdown_Master')
+        ws_dropdown.cell(1, 1, 'Valid Modes')
+        ws_dropdown.cell(2, 1, 'yes')
+        ws_dropdown.cell(3, 1, 'no')
+
+        ktlr_file = ktlr_dir / 'KTLR_Project.xlsx'
+        wb.save(ktlr_file)
+        wb.close()
+
+        # Run sync
+        ktlr_db = self.root / 'ktlr_yes_test.sqlite3'
+        sync_result = sync(ktlr_db, [str(ktlr_dir)], threading.Event(), rebuild=True)
+        self.assertEqual(sync_result['indexed'], 1)
+
+        # Verify sync status shows Dropdown_Master as excluded lookup sheet
+        excluded_statuses = [s for s in sync_result['file_status'] if s.get('status') == 'excluded']
+        self.assertTrue(any('Dropdown_Master' in s['path'] and 'excluded: lookup sheet' in s['reason'] for s in excluded_statuses))
+
+        # Search for 'yes'
+        total, rows = search(ktlr_db, 'yes')
+        self.assertEqual(total, 20)
+
+        # Group search results: should return exactly 1 group (Email Register)
+        groups = group_search_results(rows)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]['sheet'], 'Email Register')
+        self.assertEqual(groups[0]['match_count'], 20)
+        self.assertEqual(groups[0]['file_name'], 'KTLR_Project.xlsx')
+        # Check that unnamed column J is labeled 'Col J' with is_unnamed
+        self.assertIn('Col J', groups[0]['labels'])
+        self.assertIn('J', groups[0]['unnamed_cols'])
+        # None from Dropdown_Master
+        self.assertFalse(any(g['sheet'] == 'Dropdown_Master' for g in groups))
+        self.assertFalse(any(r['sheet'] == 'Dropdown_Master' for r in rows))
+
+
+    def test_multi_folder_global_pagination_bug_fix(self):
+        """Two files in two registered folders; keyword with 260+20 matches; no folder → 2 groups, total 280; folder B → 1 group, 20."""
+        from local_register_search.search import group_search_results
+
+        folder_a = self.root / 'folder_a'
+        folder_b = self.root / 'folder_b'
+        folder_a.mkdir(exist_ok=True)
+        folder_b.mkdir(exist_ok=True)
+
+        # File A: 260 data rows, every row has 'yes'
+        wb_a = Workbook()
+        ws_a = wb_a.active
+        ws_a.title = 'Outgoing'
+        ws_a.append(['Sr No', 'Date', 'Subject', 'Status'])
+        for i in range(260):
+            ws_a.append([i + 1, '01-01-2024', f'Letter {i + 1}', 'yes'])
+        wb_a.save(folder_a / 'Correspondence_Register.xlsx')
+        wb_a.close()
+
+        # File B: 20 data rows, every row has 'yes'
+        wb_b = Workbook()
+        ws_b = wb_b.active
+        ws_b.title = 'Email Register'
+        ws_b.append(['Sr No', 'Subject', 'Status'])
+        for i in range(20):
+            ws_b.append([i + 1, f'Email {i + 1}', 'yes'])
+        wb_b.save(folder_b / 'KTLR_Project.xlsx')
+        wb_b.close()
+
+        db_path = self.root / 'multi_folder_test.sqlite3'
+        sync_result = sync(db_path, [str(folder_a), str(folder_b)], threading.Event(), rebuild=True)
+        self.assertEqual(sync_result['indexed'], 2, sync_result)
+
+        # No folder filter → both groups, total 280
+        total, rows = search(db_path, 'yes', folders=[str(folder_a), str(folder_b)])
+        self.assertEqual(total, 280, f'Expected 280 total, got {total}')
+        groups = group_search_results(rows)
+        self.assertEqual(len(groups), 2, f'Expected 2 groups, got {len(groups)}: {[g["file_name"] for g in groups]}')
+        counts = {g['file_name']: g['match_count'] for g in groups}
+        self.assertEqual(counts.get('Correspondence_Register.xlsx'), 260)
+        self.assertEqual(counts.get('KTLR_Project.xlsx'), 20)
+
+        # Folder B selected → only 1 group, 20 matches
+        total_b, rows_b = search(db_path, 'yes', folder=str(folder_b), folders=[str(folder_a), str(folder_b)])
+        self.assertEqual(total_b, 20, f'Expected 20 total for folder B, got {total_b}')
+        groups_b = group_search_results(rows_b)
+        self.assertEqual(len(groups_b), 1, f'Expected 1 group for folder B, got {len(groups_b)}')
+        self.assertEqual(groups_b[0]['match_count'], 20)
+        self.assertEqual(groups_b[0]['file_name'], 'KTLR_Project.xlsx')
 
 
 if __name__ == '__main__':

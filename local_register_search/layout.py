@@ -3,9 +3,10 @@ import html
 from PySide6.QtCore import Qt, QVariantAnimation, QEasingCurve, QRectF, QEvent, QPointF, QSize, QRect, QPoint, QTimer
 from PySide6.QtGui import QTextDocument, QTextOption, QTextCursor, QTextBlockFormat, QFontMetrics, QAbstractTextDocumentLayout, QPalette, QPainter, QColor, QPen, QPolygonF, QPixmap, QIcon
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QLineEdit, QComboBox, QSplitter, QTableWidget, QTextBrowser,
+    QListWidget, QLineEdit, QComboBox, QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser,
     QProgressBar, QFrame, QMessageBox, QDialog, QStyledItemDelegate, QStyle, QHeaderView,
-    QStyleOptionViewItem, QTableView, QGridLayout, QCheckBox, QLayout, QStackedWidget, QScrollArea, QSizePolicy)
+    QStyleOptionViewItem, QTableView, QGridLayout, QCheckBox, QLayout, QStackedWidget, QScrollArea, QSizePolicy,
+    QInputDialog, QMenu, QApplication)
 from .filter_dropdown import ContentCombo
 
 
@@ -74,6 +75,8 @@ DARK_STYLE = '''
     QMainWindow, QWidget#root, QDialog, QStackedWidget,
     QScrollArea, QWidget#pageContent, QWidget#pageViewport { background: #111e2a; }
     QFrame#card { background: #1b2d3d; border-color: #385064; }
+    QFrame#groupCard { background: #1b2d3d; border: 1px solid #385064; border-radius: 8px; }
+    QFrame#groupHeader { background: #223747; border-top-left-radius: 7px; border-top-right-radius: 7px; }
     QPushButton { background: #22394a; color: #d8e5ed; border-color: #5d9daf; }
     QPushButton:hover { background: #31546a; }
     QPushButton#primary { background: #167084; color: #ffffff; border-color: #167084; }
@@ -237,9 +240,10 @@ class LiftTable(QTableWidget):
 
 
 class MatchDelegate(QStyledItemDelegate):
-    def __init__(self, window):
-        super().__init__(window.table)
+    def __init__(self, window, table=None):
+        super().__init__(table or window.table)
         self.window = window
+        self.target_table = table or window.table
 
     def visible_lines(self, value, font, width, column):
         metrics = QFontMetrics(font)
@@ -277,7 +281,8 @@ class MatchDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option, index):
         self.initStyleOption(option, index)
-        width = self.window.table.columnWidth(index.column())
+        table = getattr(self, 'target_table', None) or self.window.table
+        width = table.columnWidth(index.column()) if table else 100
         return QSize(width, max(18, option.fontMetrics.height() + 2))
 
     def paint(self, painter, option, index):
@@ -290,7 +295,9 @@ class MatchDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if not self.window.dark_mode:
-            color = '#E6F4F2' if selected else '#F0F8F7' if index.row() == self.window.table.hover_row else '#fbfcfd' if index.row() % 2 else '#ffffff'
+            table = getattr(self, 'target_table', None) or self.window.table
+            hover_row = getattr(table, 'hover_row', -1)
+            color = '#E6F4F2' if selected else '#F0F8F7' if index.row() == hover_row else '#fbfcfd' if index.row() % 2 else '#ffffff'
             painter.fillRect(option.rect, QColor(color))
         rect = option.rect.adjusted(6, 1, -6, -1)
         doc = self.document(value, option.font, rect.width(), index.column(), option.displayAlignment, index.data(Qt.ItemDataRole.UserRole) not in ('metadata', 'empty-cell'))
@@ -303,6 +310,320 @@ class MatchDelegate(QStyledItemDelegate):
         painter.translate(rect.left(), rect.top() + max(0, (rect.height() - doc.size().height()) / 2))
         doc.documentLayout().draw(painter, context)
         painter.restore()
+
+
+class GroupSectionWidget(QFrame):
+    def __init__(self, window, group, group_index, initially_expanded=True, parent=None):
+        super().__init__(parent)
+        self.window = window
+        self.group = group
+        self.group_index = group_index
+        self.expanded = initially_expanded
+        self.populated = False
+        self.rendered_count = 0
+        self.rendered_rows = []
+        self.INITIAL_BATCH_SIZE = 10
+        self.SHOW_MORE_BATCH_SIZE = 50
+        self.BATCH_SIZE = 10
+        self.setObjectName('groupCard')
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header Frame
+        self.header_frame = QFrame()
+        self.header_frame.setObjectName('groupHeader')
+        self.header_frame.setCursor(Qt.CursorShape.PointingHandCursor)
+        header_layout = QHBoxLayout(self.header_frame)
+        header_layout.setContentsMargins(10, 6, 10, 6)
+        header_layout.setSpacing(8)
+
+        self.toggle_btn = QPushButton("▼" if self.expanded else "▶")
+        self.toggle_btn.setFixedSize(22, 22)
+        self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle_btn.setStyleSheet('font-size:11px;font-weight:bold;color:#167084;background:transparent;border:none;padding:0;')
+        self.toggle_btn.clicked.connect(self.toggle_collapse)
+        header_layout.addWidget(self.toggle_btn)
+
+        title_text = f"<b>{html.escape(self.group['file_name'])}</b> &nbsp;›&nbsp; <span style='color:#167084;font-weight:600;'>{html.escape(self.group['sheet'])}</span>"
+        self.title_label = QLabel(title_text)
+        self.title_label.setStyleSheet('font-size:13px;')
+        header_layout.addWidget(self.title_label)
+
+        folder_text = f"<span style='color:#6d7f92;font-size:11px;'>📁 {html.escape(self.group['folder'])}</span>"
+        self.folder_label = QLabel(folder_text)
+        header_layout.addWidget(self.folder_label)
+
+        header_layout.addStretch(1)
+
+        count = self.group['match_count']
+        badge_text = f"<span style='background:#e6f3f5;color:#126175;border:1px solid #7fb1bd;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;'>{count} match{'es' if count != 1 else ''}</span>"
+        self.count_badge = QLabel(badge_text)
+        header_layout.addWidget(self.count_badge)
+
+        self.open_file_btn = QPushButton(' Open file')
+        self.open_file_btn.setIcon(action_icon('Open'))
+        self.open_file_btn.setIconSize(QSize(13, 13))
+        self.open_file_btn.setFixedHeight(22)
+        self.open_file_btn.setStyleSheet('font-size:11px;padding:1px 6px;')
+        self.open_file_btn.setToolTip(f"Open {self.group['file_name']}")
+        if self.group['rows']:
+            self.open_file_btn.clicked.connect(lambda: self.window.open_path(False, self.group['rows'][0]))
+        header_layout.addWidget(self.open_file_btn)
+
+        self.open_folder_btn = QPushButton(' Open folder')
+        self.open_folder_btn.setIcon(action_icon('folder'))
+        self.open_folder_btn.setIconSize(QSize(13, 13))
+        self.open_folder_btn.setFixedHeight(22)
+        self.open_folder_btn.setStyleSheet('font-size:11px;padding:1px 6px;')
+        self.open_folder_btn.setToolTip(f"Open containing folder: {self.group['folder_path']}")
+        if self.group['rows']:
+            self.open_folder_btn.clicked.connect(lambda: self.window.open_path(True, self.group['rows'][0]))
+        header_layout.addWidget(self.open_folder_btn)
+
+        def header_click(event):
+            child = self.header_frame.childAt(event.position().toPoint())
+            if child not in (self.open_file_btn, self.open_folder_btn):
+                self.toggle_collapse()
+        self.header_frame.mousePressEvent = header_click
+
+        layout.addWidget(self.header_frame)
+
+        # Content Widget
+        self.content_widget = QWidget()
+        content_layout = QVBoxLayout(self.content_widget)
+        content_layout.setContentsMargins(6, 6, 6, 6)
+        content_layout.setSpacing(6)
+
+        self.table = QTableWidget()
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(20)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.table.horizontalHeader().setFixedHeight(26)
+        self.table.horizontalHeader().setSectionsClickable(True)
+        self.table.horizontalHeader().setSortIndicatorShown(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.delegate = MatchDelegate(self.window, self.table)
+        self.table.setItemDelegate(self.delegate)
+
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+        self.table.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.horizontalHeader().customContextMenuRequested.connect(self.show_header_menu)
+        self.table.horizontalHeader().sectionDoubleClicked.connect(self.rename_column_dialog)
+        self.table.cellClicked.connect(self.on_cell_clicked)
+        self.table.itemSelectionChanged.connect(self.on_selection_changed)
+
+        content_layout.addWidget(self.table)
+
+        left = len(self.group['rows']) - self.INITIAL_BATCH_SIZE
+        self.show_more_btn = QPushButton(f"Show more ({left})")
+        self.show_more_btn.setStyleSheet('padding:4px 12px;font-size:11px;')
+        self.show_more_btn.clicked.connect(self.show_more)
+        self.show_more_btn.setVisible(left > 0)
+        content_layout.addWidget(self.show_more_btn, 0, Qt.AlignmentFlag.AlignCenter)
+
+        layout.addWidget(self.content_widget)
+        self.content_widget.setVisible(self.expanded)
+        if self.expanded:
+            self.populate_table()
+
+    def populate_table(self):
+        if self.populated:
+            return
+        self.populated = True
+        cols = self.group['columns']
+        labels = self.group['labels']
+        unnamed_cols = self.group.get('unnamed_cols', set())
+        has_section = any(r.get('row_section') for r in self.group['rows'])
+        headers = ['Row'] + labels + (['Section'] if has_section else [])
+        self.has_section = has_section
+        self.section_column = len(headers) - 1 if has_section else -1
+
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+
+        self.table.setColumnWidth(0, 48)
+        if has_section:
+            self.table.setColumnWidth(self.section_column, 200)
+
+        for j, col in enumerate(cols, 1):
+            col_label = labels[j - 1]
+            name = col_label.casefold()
+            width = 310 if 'subject' in name or 'description' in name else 180 if 'letter' in name else 110 if 'date' in name else 70 if name in ('s. n.', 's.n.', 's no', 's. no.') else 130
+            self.table.setColumnWidth(j, width)
+            item = self.table.horizontalHeaderItem(j)
+            if item:
+                if col in unnamed_cols:
+                    item.setForeground(QColor('#8898aa'))
+                    item.setToolTip(f"{col_label} (Unnamed column — double-click or right-click to rename)")
+                else:
+                    item.setToolTip(f"Column {col}: {col_label}")
+
+        self.append_rows(self.group['rows'][:self.INITIAL_BATCH_SIZE])
+
+    def append_rows(self, rows_to_add):
+        import json
+        import re
+        start_row = self.table.rowCount()
+        self.table.setRowCount(start_row + len(rows_to_add))
+        cols = self.group['columns']
+
+        for offset, row in enumerate(rows_to_add):
+            i = start_row + offset
+            self.rendered_rows.append(row)
+            cells = None
+            if 'cells' in row:
+                try:
+                    cells = json.loads(row['cells'] or '{}')
+                except Exception:
+                    pass
+            if cells is None:
+                cells = row.get('cells_dict') or {}
+
+            item_row = QTableWidgetItem(str(row['rownum']))
+            item_row.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            item_row.setData(Qt.ItemDataRole.UserRole, 'metadata')
+            self.table.setItem(i, 0, item_row)
+
+            for j, col in enumerate(cols, 1):
+                val = self.window.display_cell(cells.get(col, ''))
+                item = QTableWidgetItem(val if val else '-')
+                if not val:
+                    item.setData(Qt.ItemDataRole.UserRole, 'empty-cell')
+                numeric = bool(re.fullmatch(r'[+-]?(?:\d[\d,]*(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?%?', val.strip())) if val else False
+                item.setTextAlignment((Qt.AlignmentFlag.AlignRight if numeric else Qt.AlignmentFlag.AlignLeft) | Qt.AlignmentFlag.AlignVCenter)
+                item.setToolTip(val)
+                self.table.setItem(i, j, item)
+
+            if self.has_section:
+                sec_val = row.get('row_section') or ''
+                sec_item = QTableWidgetItem(sec_val if sec_val else '-')
+                sec_item.setToolTip(sec_val)
+                self.table.setItem(i, self.section_column, sec_item)
+
+        self.rendered_count += len(rows_to_add)
+        self.update_table_height()
+
+    def update_table_height(self):
+        row_count = self.table.rowCount()
+        header_h = self.table.horizontalHeader().height() if self.table.horizontalHeader().isVisible() else 26
+        row_h = self.table.verticalHeader().defaultSectionSize() or 20
+        height = max(50, header_h + row_count * row_h + 4)
+        self.table.setFixedHeight(height)
+
+    def show_more(self):
+        remaining = self.group['rows'][self.rendered_count:self.rendered_count + self.SHOW_MORE_BATCH_SIZE]
+        self.append_rows(remaining)
+        left = len(self.group['rows']) - self.rendered_count
+        if left > 0:
+            self.show_more_btn.setText(f"Show more ({left})")
+        else:
+            self.show_more_btn.hide()
+
+    def toggle_collapse(self):
+        self.expanded = not self.expanded
+        self.toggle_btn.setText("▼" if self.expanded else "▶")
+        if self.expanded and not self.populated:
+            self.populate_table()
+        self.content_widget.setVisible(self.expanded)
+
+    def on_cell_clicked(self, row_idx, col_idx):
+        if 0 <= row_idx < len(self.rendered_rows):
+            self.window.select_record_data(self.rendered_rows[row_idx])
+
+    def on_selection_changed(self):
+        selected = self.table.selectionModel().selectedRows()
+        if selected:
+            row_idx = selected[0].row()
+            if 0 <= row_idx < len(self.rendered_rows):
+                self.window.select_record_data(self.rendered_rows[row_idx])
+
+    def show_header_menu(self, pos):
+        logical_index = self.table.horizontalHeader().logicalIndexAt(pos)
+        cols = self.group['columns']
+        if 1 <= logical_index <= len(cols):
+            col_letter = cols[logical_index - 1]
+            menu = QMenu(self)
+            a_rename = menu.addAction(f"Rename Column {col_letter}...")
+            action = menu.exec(self.table.horizontalHeader().viewport().mapToGlobal(pos))
+            if action == a_rename:
+                self.rename_column_dialog(logical_index)
+
+    def rename_column_dialog(self, logical_index):
+        import json
+        from .database import connect
+        cols = self.group['columns']
+        labels = self.group['labels']
+        if logical_index == 0:
+            return
+        if self.has_section and logical_index == len(cols) + 1:
+            return
+        col_idx = logical_index - 1
+        if not (0 <= col_idx < len(cols)):
+            return
+        col_letter = cols[col_idx]
+        current_label = labels[col_idx]
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Column",
+            f"Enter name for Column {col_letter} ({self.group['file_name']} › {self.group['sheet']}):",
+            text=current_label
+        )
+        if ok and new_name.strip():
+            new_name = new_name.strip()
+            labels[col_idx] = new_name
+            self.group['headers'][col_letter] = new_name
+            if col_letter in self.group.get('unnamed_cols', set()):
+                self.group['unnamed_cols'].discard(col_letter)
+            db = connect(self.window.path)
+            try:
+                with db:
+                    db.execute("INSERT OR REPLACE INTO sheet_headers VALUES(?,?,?)",
+                               (self.group['file_path'], self.group['sheet'], json.dumps(self.group['headers'], ensure_ascii=False)))
+            finally:
+                db.close()
+            header_item = self.table.horizontalHeaderItem(logical_index)
+            if header_item:
+                header_item.setText(new_name)
+                header_item.setForeground(QColor('#d8e5ed' if self.window.dark_mode else '#142338'))
+                header_item.setToolTip(f"Column {col_letter}: {new_name}")
+            self.window.notify(f"Column {col_letter} renamed to '{new_name}'")
+
+    def show_context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if not item:
+            return
+        row_idx = item.row()
+        if 0 <= row_idx < len(self.rendered_rows):
+            row_data = self.rendered_rows[row_idx]
+            menu = QMenu(self)
+            a_open_file = menu.addAction("Open file")
+            a_open_folder = menu.addAction("Open containing folder")
+            menu.addSeparator()
+            a_copy_row = menu.addAction("Copy row")
+            a_copy_path = menu.addAction("Copy file path")
+            action = menu.exec(self.table.viewport().mapToGlobal(pos))
+            if action == a_open_file:
+                self.window.open_path(False, row_data)
+            elif action == a_open_folder:
+                self.window.open_path(True, row_data)
+            elif action == a_copy_row:
+                self.window.copy_row(row_data)
+            elif action == a_copy_path:
+                QApplication.clipboard().setText(row_data['path'])
+                self.window.notify('File path copied to clipboard')
 
 
 def build(window):
@@ -341,6 +662,8 @@ def build(window):
         QComboBox[filterControl="true"]::down-arrow { image: none; }
         QComboBox[filterControl="true"] QAbstractItemView { background: #f8fafb; color: #126175; border: 1px solid #7fb1bd; padding: 4px; selection-background-color: #167084; selection-color: white; }
         QFrame#card { background: white; border: 1px solid #dbe3eb; border-radius: 7px; }
+        QFrame#groupCard { background: white; border: 1px solid #d2dbe3; border-radius: 8px; }
+        QFrame#groupHeader { background: #f1f6f8; border-top-left-radius: 7px; border-top-right-radius: 7px; }
         QTableView { background: white; alternate-background-color: #fbfcfd; border: none; selection-background-color: #E6F4F2; selection-color: #0c1c30; }
         QTableView { font-size:12px; }
         QTableWidget::item { padding: 1px 6px; border-bottom: 1px solid #e8edf2; }
@@ -509,13 +832,34 @@ def build(window):
     window.result_count.setStyleSheet('font-size:10px;color:#52647b;')
     window.result_count.setWordWrap(True)
     result_header.addWidget(window.result_count, 1)
+    window.group_sort_combo = QComboBox()
+    window.group_sort_combo.addItem('Sort: Most matches', 'matches')
+    window.group_sort_combo.addItem('Sort: Alphabetical', 'alphabetical')
+    window.group_sort_combo.setFixedHeight(26)
+    window.group_sort_combo.setMinimumWidth(155)
+    window.group_sort_combo.setProperty('filterControl', True)
+    window.group_sort_combo.setToolTip('Sort order for source file/worksheet groups')
+    result_header.addWidget(window.group_sort_combo)
     window.export_button = button('Export results', window.export_results, result_header)
     window.export_button.setIcon(QIcon())
     window.export_button.setFixedHeight(26)
     window.export_button.setEnabled(False)
     window.export_button.setToolTip('Export all matching rows to Excel or CSV')
     result_layout.addLayout(result_header)
+    window.results_scroll = QScrollArea()
+    window.results_scroll.setWidgetResizable(True)
+    window.results_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    window.results_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    window.results_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    window.groups_widget = QWidget()
+    window.groups_layout = QVBoxLayout(window.groups_widget)
+    window.groups_layout.setContentsMargins(8, 8, 8, 8)
+    window.groups_layout.setSpacing(12)
+    window.results_scroll.setWidget(window.groups_widget)
+    result_layout.addWidget(window.results_scroll, 1)
     window.table = LiftTable(0, 3)
+    window._legacy_table = window.table
+    window.table.hide()
     window.table.setHorizontalHeaderLabels(['File', 'Sheet', 'Row'])
     window.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     window.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -554,7 +898,8 @@ def build(window):
     window.column_resize_timer.setInterval(120)
     window.column_resize_timer.timeout.connect(window.finish_column_resize)
     window.table.horizontalHeader().sectionResized.connect(window.table_column_resized)
-    result_layout.addWidget(window.table, 1)
+    # Note: window.table is no longer added to result_layout (flat table removed).
+    # Only grouped cards inside window.results_scroll are displayed.
     window.empty_card = QWidget()
     empty = QVBoxLayout(window.empty_card)
     empty.setContentsMargins(32, 32, 32, 32)
@@ -741,6 +1086,19 @@ def build(window):
     window.controls.append(button('Rebuild index', lambda: window.start_sync(True), recent_actions))
     recent_actions.addStretch(1)
     settings.addLayout(recent_actions)
+    settings.addSpacing(16)
+    lookup_title = QLabel('Lookup worksheets')
+    lookup_title.setStyleSheet('font-size:14px;font-weight:600;')
+    settings.addWidget(lookup_title)
+    lookup_desc = QLabel('Worksheets named dropdown, lookup, master list, lists, config, validation are excluded by default.\nCheck a file below to include its lookup sheets:')
+    lookup_desc.setWordWrap(True)
+    lookup_desc.setStyleSheet('color:#52647b;font-size:11px;')
+    settings.addWidget(lookup_desc)
+    window.lookup_settings_widget = QWidget()
+    window.lookup_settings_container = QVBoxLayout(window.lookup_settings_widget)
+    window.lookup_settings_container.setContentsMargins(0, 4, 0, 4)
+    window.lookup_settings_container.setSpacing(4)
+    settings.addWidget(window.lookup_settings_widget)
     settings.addSpacing(22)
     danger = QLabel('Danger zone')
     danger.setStyleSheet('color:#b42318;font-size:20px;font-weight:600;')

@@ -1,4 +1,5 @@
 import datetime
+import os
 import re
 from zipfile import ZipFile
 from xml.etree.ElementTree import iterparse
@@ -6,6 +7,33 @@ from pathlib import Path
 import openpyxl
 import xlrd
 from openpyxl.utils import get_column_letter
+from .sync_logger import log_info, log_debug, log_warning
+
+
+def safe_open_rb(path):
+    """Open a file in binary mode with full Windows sharing rights (READ | WRITE | DELETE)."""
+    if os.name == 'nt':
+        import ctypes
+        import msvcrt
+        kernel32 = ctypes.windll.kernel32
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_ALL = 1 | 2 | 4  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+
+        handle = kernel32.CreateFileW(
+            str(path),
+            GENERIC_READ,
+            FILE_SHARE_ALL,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None
+        )
+        if handle != -1 and handle != 0xFFFFFFFFFFFFFFFF:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+            return open(fd, 'rb', closefd=True)
+    return open(path, 'rb')
 
 
 class Cancelled(Exception):
@@ -26,24 +54,50 @@ def display(value, fmt=''):
 def merged_rows(path, worksheet_path, cancel):
     rows = set()
     from openpyxl.utils.cell import range_boundaries
-    with ZipFile(path) as archive, archive.open(worksheet_path.lstrip('/')) as stream:
-        for event, element in iterparse(stream, events=('end',)):
-            if cancel.is_set():
-                raise Cancelled()
-            if element.tag.endswith('}mergeCell'):
-                left, top, right, bottom = range_boundaries(element.attrib['ref'])
-                if right > left:
-                    rows.add(top)
-            element.clear()
+    target = worksheet_path.replace('\\', '/').lstrip('/')
+    try:
+        with safe_open_rb(path) as f_zip:
+            with ZipFile(f_zip) as archive:
+                namelist = archive.namelist()
+                if target not in namelist:
+                    candidates = [n for n in namelist if n.endswith(target.split('/')[-1])]
+                    if candidates:
+                        target = candidates[0]
+                    else:
+                        return rows
+                with archive.open(target) as stream:
+                    for event, element in iterparse(stream, events=('end',)):
+                        if cancel.is_set():
+                            raise Cancelled()
+                        if element.tag.endswith('}mergeCell'):
+                            try:
+                                left, top, right, bottom = range_boundaries(element.attrib['ref'])
+                                if right > left:
+                                    rows.add(top)
+                            except ValueError as ve:
+                                log_debug(f"Invalid mergeCell ref '{element.attrib.get('ref')}': {ve}")
+                        element.clear()
+    except Cancelled:
+        raise
+    except Exception as exc:
+        log_debug(f"Could not inspect merged cells in {worksheet_path}: {exc}")
     return rows
 
 
 def read_rows(path, cancel, with_context=False):
     """Yield actual row references; never evaluate formulas or save a workbook."""
     if Path(path).suffix.lower() == '.xls':
-        book = xlrd.open_workbook(path, on_demand=True, formatting_info=True)
         try:
-            for sheet_name in book.sheet_names():
+            with safe_open_rb(path) as f_xls:
+                content = f_xls.read()
+            book = xlrd.open_workbook(file_contents=content, on_demand=True, formatting_info=True)
+        except Exception as exc:
+            log_warning(f"safe_open_rb on '{path}' failed: {exc}; falling back to file path")
+            book = xlrd.open_workbook(str(path), on_demand=True, formatting_info=True)
+        try:
+            sheet_names = book.sheet_names()
+            log_info(f"Worksheets found in '{path}': {sheet_names}")
+            for sheet_name in sheet_names:
                 sheet = book.sheet_by_name(sheet_name)
                 for r in range(sheet.nrows):
                     if cancel.is_set():
@@ -69,10 +123,18 @@ def read_rows(path, cancel, with_context=False):
         finally:
             book.release_resources()
         return
-    cached = openpyxl.load_workbook(path, read_only=True, data_only=True, keep_links=False)
+
+    f_cached = None
+    f_formulas = None
+    cached = None
     formulas = None
     try:
-        formulas = openpyxl.load_workbook(path, read_only=True, data_only=False, keep_links=False)
+        f_cached = safe_open_rb(path)
+        f_formulas = safe_open_rb(path)
+        cached = openpyxl.load_workbook(f_cached, read_only=True, data_only=True, keep_links=False)
+        formulas = openpyxl.load_workbook(f_formulas, read_only=True, data_only=False, keep_links=False)
+        sheet_names = cached.sheetnames
+        log_info(f"Worksheets found in '{path}': {sheet_names}")
         for sheet in cached:
             raw = formulas[sheet.title]
             merges = merged_rows(path, raw._worksheet_path, cancel) if with_context else set()
@@ -89,11 +151,16 @@ def read_rows(path, cancel, with_context=False):
                         text = '[Formula: cached value unavailable] ' + str(original.value)
                     if text:
                         cells[get_column_letter(col)] = text
-                        styled |= bool(original.font.bold or original.fill.patternType)
+                        styled |= bool((original.font and original.font.bold) or (original.fill and original.fill.patternType))
                 if cells:
                     record = (sheet.title, rownum, sheet.sheet_state != 'visible', cells)
                     yield record + ({'styled': styled, 'merged': rownum in merges},) if with_context else record
     finally:
-        cached.close()
-        if formulas:
+        if cached is not None:
+            cached.close()
+        if formulas is not None:
             formulas.close()
+        if f_cached is not None:
+            f_cached.close()
+        if f_formulas is not None:
+            f_formulas.close()

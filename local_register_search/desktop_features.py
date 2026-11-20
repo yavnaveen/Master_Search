@@ -84,7 +84,81 @@ def export_records(destination, records):
             os.unlink(temporary)
 
 
+def sanitize_sheet_title(name):
+    # Invalid characters in Excel worksheet names: \ / ? * : [ ]
+    cleaned = re.sub(r'[\\/*?:\[\]]', '_', str(name or '')).strip()
+    return cleaned or 'Sheet'
+
+
+def generate_unique_sheet_name(file_name, sheet_name, existing_names):
+    """Generate an Excel sheet name (max 31 characters, unique case-insensitively)."""
+    clean_file = sanitize_sheet_title(Path(file_name).stem)
+    clean_sheet = sanitize_sheet_title(sheet_name)
+    combined = f"{clean_sheet} ({clean_file})"
+    if len(combined) <= 31:
+        base = combined
+    else:
+        base = f"{clean_sheet[:17]}_{clean_file[:13]}"
+
+    base = base[:31].strip() or 'Sheet'
+    lower_existing = {n.casefold() for n in existing_names}
+    if base.casefold() not in lower_existing:
+        existing_names.add(base)
+        return base
+
+    counter = 1
+    while True:
+        suffix = f"_{counter}"
+        avail = 31 - len(suffix)
+        candidate = f"{base[:avail]}{suffix}"
+        if candidate.casefold() not in lower_existing:
+            existing_names.add(candidate)
+            return candidate
+        counter += 1
+
+
 def write_records(destination, records):
+    if Path(destination).suffix.lower() == '.xlsx':
+        from .search import group_search_results
+        groups = group_search_results(records, sort_order='matches')
+        book = Workbook()
+        existing_names = set()
+        if not groups:
+            sheet = book.active
+            sheet.title = 'Results'
+            sheet.append(['Excel Row', 'Notes'])
+        else:
+            for idx, group in enumerate(groups):
+                title = generate_unique_sheet_name(group['file_name'], group['sheet'], existing_names)
+                if idx == 0:
+                    sheet = book.active
+                    sheet.title = title
+                else:
+                    sheet = book.create_sheet(title=title)
+                cols = group['columns']
+                has_section = any(r.get('row_section') for r in group['rows'])
+                headers = ['Excel Row'] + group['labels'] + (['Section'] if has_section else [])
+                sheet.append(headers)
+                for r in group['rows']:
+                    cells = r.get('cells_dict')
+                    if cells is None:
+                        try:
+                            cells = json.loads(r.get('cells') or '{}')
+                        except Exception:
+                            cells = {}
+                    row_vals = [r['rownum']] + [cells.get(c, '') for c in cols]
+                    if has_section:
+                        row_vals.append(r.get('row_section') or '')
+                    sheet.append(row_vals)
+                    for cell in sheet[sheet.max_row]:
+                        if isinstance(cell.value, str):
+                            cell.data_type = 's'
+                sheet.freeze_panes = 'B2'
+                sheet.auto_filter.ref = sheet.dimensions
+        book.save(destination)
+        book.close()
+        return len(records)
+
     columns = sorted({column for row in records for column in json.loads(row['cells'])},
                      key=lambda value: (len(value), value))
     names = {}
@@ -97,25 +171,10 @@ def write_records(destination, records):
     def values(row):
         cells = json.loads(row['cells'])
         return [row['path'], row['sheet'], row['rownum']] + [cells.get(column, '') for column in columns] + [row.get('row_section') or '']
-    if Path(destination).suffix.lower() == '.xlsx':
-        book = Workbook()
-        sheet = book.active
-        sheet.title = 'Search results'
-        sheet.append(headers)
+    with open(destination, 'w', encoding='utf-8-sig', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(headers)
         for row in records:
-            sheet.append(values(row))
-            for cell in sheet[sheet.max_row]:
-                if isinstance(cell.value, str):
-                    cell.data_type = 's'  # Preserve literal text, including leading '='.
-        sheet.freeze_panes = 'D2'
-        sheet.auto_filter.ref = sheet.dimensions
-        book.save(destination)
-        book.close()
-    else:
-        with open(destination, 'w', encoding='utf-8-sig', newline='') as stream:
-            writer = csv.writer(stream)
-            writer.writerow(headers)
-            for row in records:
-                writer.writerow(["'" + value if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')) else value
-                                 for value in values(row)])
+            writer.writerow(["'" + value if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')) else value
+                             for value in values(row)])
     return len(records)
